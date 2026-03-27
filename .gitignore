@@ -1,0 +1,13 @@
+# Build output
+ascend
+
+# Saved data file (generated at runtime)
+ascend_data.txt
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
+*.swo
