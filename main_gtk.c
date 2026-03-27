@@ -207,6 +207,8 @@ typedef struct {
     char vendor[NAME_LEN];              // vendor name
     double price;                       // current price from source
     char url[NAME_LEN * 2];             // hyperlink to product page
+    char upc[NAME_LEN];                 // UPC/GTIN from page when available
+    char manufacturer_part_number[NAME_LEN]; // supplier MPN from page when available
     int in_stock;                       // 1=available, 0=out of stock
     char last_scanned[NAME_LEN];        // YYYY-MM-DD last scraped
 } ScannedProduct;
@@ -777,6 +779,346 @@ static GtkWidget* create_labeled_entry(const char *label_text, GtkWidget *contai
     gtk_box_pack_start(GTK_BOX(container), hbox, FALSE, FALSE, 0);
 
     return entry;
+}
+
+static void trim_in_place(char *text) {
+    if (!text || !*text) return;
+    char *start = text;
+    while (*start && isspace((unsigned char)*start)) start++;
+    if (start != text) memmove(text, start, strlen(start) + 1);
+
+    size_t len = strlen(text);
+    while (len > 0 && isspace((unsigned char)text[len - 1])) {
+        text[len - 1] = '\0';
+        len--;
+    }
+}
+
+static void html_decode_in_place(char *text) {
+    if (!text) return;
+
+    struct HtmlEntityMap {
+        const char *entity;
+        const char *replacement;
+    } entities[] = {
+        {"&amp;", "&"},
+        {"&quot;", "\""},
+        {"&#39;", "'"},
+        {"&apos;", "'"},
+        {"&lt;", "<"},
+        {"&gt;", ">"}
+    };
+
+    char buffer[NAME_LEN * 2];
+    strncpy(buffer, text, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+    text[0] = '\0';
+
+    const char *cursor = buffer;
+    while (*cursor) {
+        int replaced = 0;
+        for (size_t i = 0; i < sizeof(entities) / sizeof(entities[0]); i++) {
+            size_t entity_len = strlen(entities[i].entity);
+            if (strncmp(cursor, entities[i].entity, entity_len) == 0) {
+                strncat(text, entities[i].replacement, NAME_LEN * 2 - strlen(text) - 1);
+                cursor += entity_len;
+                replaced = 1;
+                break;
+            }
+        }
+        if (!replaced) {
+            size_t len = strlen(text);
+            if (len + 1 < NAME_LEN * 2) {
+                text[len] = *cursor;
+                text[len + 1] = '\0';
+            }
+            cursor++;
+        }
+    }
+}
+
+static int extract_between(const char *source, const char *start_token, const char *end_token,
+                           char *out, size_t out_size) {
+    const char *start = strstr(source, start_token);
+    if (!start) return 0;
+    start += strlen(start_token);
+    const char *end = strstr(start, end_token);
+    if (!end || end <= start) return 0;
+
+    size_t len = (size_t)(end - start);
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    trim_in_place(out);
+    return out[0] != '\0';
+}
+
+static void normalize_url_to_absolute(const char *url, char *out, size_t out_size) {
+    if (!url || !*url) {
+        out[0] = '\0';
+    } else if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {
+        strncpy(out, url, out_size - 1);
+        out[out_size - 1] = '\0';
+    } else {
+        snprintf(out, out_size, "https://www.bikeworldiowa.com%s", url[0] == '/' ? url : "");
+        if (url[0] != '/') {
+            strncat(out, url, out_size - strlen(out) - 1);
+        }
+    }
+}
+
+static int bikeworld_fetch_html(const char *url, char **html_out, char *error_out, size_t error_size) {
+    gchar *stdout_buf = NULL;
+    gchar *stderr_buf = NULL;
+    gint exit_status = 0;
+    GError *spawn_error = NULL;
+    gchar *argv[] = { "curl", "-L", "-s", (gchar *)url, NULL };
+
+    if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+                      NULL, NULL, &stdout_buf, &stderr_buf, &exit_status, &spawn_error)) {
+        snprintf(error_out, error_size, "Unable to launch curl: %s", spawn_error ? spawn_error->message : "unknown error");
+        if (spawn_error) g_error_free(spawn_error);
+        g_free(stderr_buf);
+        return 0;
+    }
+
+    if (exit_status != 0 || !stdout_buf || !*stdout_buf) {
+        snprintf(error_out, error_size, "Failed to fetch product page.%s%s",
+                 stderr_buf && *stderr_buf ? " " : "",
+                 stderr_buf && *stderr_buf ? stderr_buf : "");
+        g_free(stdout_buf);
+        g_free(stderr_buf);
+        return 0;
+    }
+
+    *html_out = stdout_buf;
+    g_free(stderr_buf);
+    return 1;
+}
+
+static void refresh_scraped_products_store(GtkListStore *store) {
+    gtk_list_store_clear(store);
+    for (int i = 0; i < scanned_product_count; i++) {
+        GtkTreeIter iter;
+        gtk_list_store_append(store, &iter);
+        gtk_list_store_set(store, &iter,
+                          0, scanned_products[i].sku,
+                          1, scanned_products[i].name,
+                          2, scanned_products[i].category,
+                          3, scanned_products[i].price,
+                          4, scanned_products[i].vendor,
+                          5, scanned_products[i].in_stock ? "In Stock" : "Out of Stock",
+                          6, i,
+                          -1);
+    }
+}
+
+static int upsert_scraped_product(const ScannedProduct *product) {
+    for (int i = 0; i < scanned_product_count; i++) {
+        if ((product->url[0] && strcmp(scanned_products[i].url, product->url) == 0) ||
+            (product->sku[0] && strcmp(scanned_products[i].sku, product->sku) == 0)) {
+            scanned_products[i] = *product;
+            return i;
+        }
+    }
+
+    if (scanned_product_count >= MAX_QBP_CATALOG_ITEMS) return -1;
+    scanned_products[scanned_product_count] = *product;
+    return scanned_product_count++;
+}
+
+static int scrape_bikeworld_product_page(const char *url, ScannedProduct *out_product,
+                                         char *error_out, size_t error_size) {
+    if (!url || !*url) {
+        snprintf(error_out, error_size, "Enter a Bike World product URL.");
+        return 0;
+    }
+    if (!strstr(url, "bikeworldiowa.com/product/")) {
+        snprintf(error_out, error_size, "URL must be a Bike World product page.");
+        return 0;
+    }
+
+    char *html = NULL;
+    if (!bikeworld_fetch_html(url, &html, error_out, error_size)) return 0;
+
+    memset(out_product, 0, sizeof(*out_product));
+    strncpy(out_product->url, url, sizeof(out_product->url) - 1);
+
+    extract_between(html, "<meta property=\"og:title\" content=\"", "\"", out_product->name, sizeof(out_product->name));
+    extract_between(html, "\"Brand\":{\"@type\":\"Brand\",\"name\":\"", "\"", out_product->vendor, sizeof(out_product->vendor));
+    extract_between(html, "\"categoryName\":\"", "\"", out_product->category, sizeof(out_product->category));
+
+    char price_buf[64] = "";
+    if (!extract_between(html, "\"price\":\"", "\"", price_buf, sizeof(price_buf))) {
+        extract_between(html, "\"display\":\"$", "\"", price_buf, sizeof(price_buf));
+    }
+    out_product->price = atof(price_buf);
+
+    char store_sku[NAME_LEN] = "";
+    char mpn[NAME_LEN] = "";
+    char gtin[NAME_LEN] = "";
+    extract_between(html, "data-th=\"Store SKU\">", "</td>", store_sku, sizeof(store_sku));
+    extract_between(html, "data-th=\"MPN\">", "</td>", mpn, sizeof(mpn));
+    if (!extract_between(html, "\"gtin\":\"", "\"", gtin, sizeof(gtin))) {
+        extract_between(html, "\"gtins\":\"", "\"", gtin, sizeof(gtin));
+    }
+
+    if (store_sku[0]) strncpy(out_product->sku, store_sku, sizeof(out_product->sku) - 1);
+    else if (mpn[0]) strncpy(out_product->sku, mpn, sizeof(out_product->sku) - 1);
+    else if (gtin[0]) strncpy(out_product->sku, gtin, sizeof(out_product->sku) - 1);
+    strncpy(out_product->manufacturer_part_number, mpn, sizeof(out_product->manufacturer_part_number) - 1);
+    strncpy(out_product->upc, gtin, sizeof(out_product->upc) - 1);
+
+    out_product->in_stock = strstr(html, "https://schema.org/InStock") != NULL ||
+                            strstr(html, "\"label\":\"In Stock") != NULL;
+
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    if (tm_info) strftime(out_product->last_scanned, sizeof(out_product->last_scanned), "%Y-%m-%d", tm_info);
+
+    html_decode_in_place(out_product->name);
+    html_decode_in_place(out_product->vendor);
+    html_decode_in_place(out_product->category);
+    trim_in_place(out_product->name);
+    trim_in_place(out_product->vendor);
+    trim_in_place(out_product->category);
+    trim_in_place(out_product->sku);
+
+    g_free(html);
+
+    if (!out_product->name[0]) {
+        snprintf(error_out, error_size, "Could not extract product name from page.");
+        return 0;
+    }
+    if (!out_product->vendor[0]) strncpy(out_product->vendor, "Bike World", sizeof(out_product->vendor) - 1);
+    if (!out_product->category[0]) strncpy(out_product->category, "Uncategorized", sizeof(out_product->category) - 1);
+    if (!out_product->sku[0]) strncpy(out_product->sku, "WEB-IMPORT", sizeof(out_product->sku) - 1);
+    return 1;
+}
+
+static int scrape_bikeworld_catalog_page(const char *url, int *imported_count,
+                                         char *error_out, size_t error_size) {
+    char *html = NULL;
+    if (!bikeworld_fetch_html(url, &html, error_out, error_size)) return 0;
+
+    const char *cursor = html;
+    int imported = 0;
+    int skipped = 0;
+    char seen_urls[64][NAME_LEN * 2];
+    int seen_count = 0;
+
+    while ((cursor = strstr(cursor, "href=\"")) != NULL) {
+        cursor += strlen("href=\"");
+        const char *end = strstr(cursor, "\"");
+        if (!end) break;
+
+        char link[NAME_LEN * 2];
+        size_t len = (size_t)(end - cursor);
+        if (len >= sizeof(link)) len = sizeof(link) - 1;
+        memcpy(link, cursor, len);
+        link[len] = '\0';
+
+        if (strstr(link, "/product/") && strstr(link, ".htm")) {
+            char full_url[NAME_LEN * 2];
+            normalize_url_to_absolute(link, full_url, sizeof(full_url));
+
+            int already_seen = 0;
+            for (int i = 0; i < seen_count; i++) {
+                if (strcmp(seen_urls[i], full_url) == 0) {
+                    already_seen = 1;
+                    break;
+                }
+            }
+
+            if (!already_seen && seen_count < 64) {
+                strncpy(seen_urls[seen_count], full_url, sizeof(seen_urls[seen_count]) - 1);
+                seen_urls[seen_count][sizeof(seen_urls[seen_count]) - 1] = '\0';
+                seen_count++;
+
+                ScannedProduct product;
+                char product_error[256];
+                if (scrape_bikeworld_product_page(full_url, &product, product_error, sizeof(product_error))) {
+                    if (upsert_scraped_product(&product) >= 0) imported++;
+                    else {
+                        g_free(html);
+                        snprintf(error_out, error_size, "Scraped product cache is full.");
+                        return 0;
+                    }
+                } else {
+                    skipped++;
+                }
+            }
+        }
+
+        cursor = end + 1;
+    }
+
+    g_free(html);
+    if (imported_count) *imported_count = imported;
+    if (imported == 0) {
+        snprintf(error_out, error_size, skipped > 0 ? "Found product links, but none could be parsed." : "No product links found on the page.");
+        return 0;
+    }
+    return 1;
+}
+
+static int import_scanned_product_to_store(const ScannedProduct *scraped, char *error_out, size_t error_size) {
+    if (!scraped || !scraped->sku[0]) {
+        snprintf(error_out, error_size, "Select a scraped product first.");
+        return 0;
+    }
+
+    int si = choose_store_index();
+    if (si < 0) {
+        snprintf(error_out, error_size, "Store selection canceled.");
+        return 0;
+    }
+
+    Store *s = &stores[si];
+    Product *p = NULL;
+    for (int i = 0; i < s->product_count; i++) {
+        if (strcmp(s->products[i].sku, scraped->sku) == 0) {
+            p = &s->products[i];
+            break;
+        }
+    }
+
+    if (!p) {
+        if (s->product_count >= MAX_PRODUCTS) {
+            snprintf(error_out, error_size, "Store product capacity reached.");
+            return 0;
+        }
+        p = &s->products[s->product_count++];
+        memset(p, 0, sizeof(Product));
+        p->min_on_season = 1;
+        p->max_on_season = 4;
+        p->min_off_season = 0;
+        p->max_off_season = 2;
+    }
+
+    strncpy(p->sku, scraped->sku, NAME_LEN - 1);
+    p->sku[NAME_LEN - 1] = '\0';
+    strncpy(p->name, scraped->name, NAME_LEN - 1);
+    p->name[NAME_LEN - 1] = '\0';
+    strncpy(p->vendor, scraped->vendor, NAME_LEN - 1);
+    p->vendor[NAME_LEN - 1] = '\0';
+    strncpy(p->brand, scraped->vendor, NAME_LEN - 1);
+    p->brand[NAME_LEN - 1] = '\0';
+    strncpy(p->upc, scraped->upc, NAME_LEN - 1);
+    p->upc[NAME_LEN - 1] = '\0';
+    strncpy(p->manufacturer_part_number, scraped->manufacturer_part_number, NAME_LEN - 1);
+    p->manufacturer_part_number[NAME_LEN - 1] = '\0';
+    strncpy(p->style_name, scraped->category, NAME_LEN - 1);
+    p->style_name[NAME_LEN - 1] = '\0';
+    p->msrp = scraped->price;
+    p->price = scraped->price;
+    if (p->stock < 0) p->stock = 0;
+
+    char audit_details[256];
+    snprintf(audit_details, sizeof(audit_details), "Imported scraped product SKU:%s Name:%s Store:%s", p->sku, p->name, s->name);
+    add_audit_log_entry(current_sales_user, "ScrapedProductImport", audit_details);
+    save_data();
+    return 1;
 }
 
 static void set_desktop_locked(int locked) {
@@ -1871,29 +2213,33 @@ static void apply_visual_theme(ThemeMode mode) {
         "button { background-image: linear-gradient(to bottom, #4A9EE7, #2B6CB0); color: white; border: none; border-radius: 8px; padding: 8px 18px; font-weight: 600; }"
         "button:hover { background-image: linear-gradient(to bottom, #63B3ED, #3182CE); }"
         "button:active { background-image: linear-gradient(to bottom, #1D6BAE, #1558A0); }"
-        "button:disabled { background-image: none; background-color: #CBD5E0; color: #A0AEC0; }"
+        "button:disabled { background-image: none; background-color: #CBD5E0; color: #64748B; }"
         "button.suggested-action { background-image: linear-gradient(to bottom, #38A169, #276749); color: white; }"
         "button.suggested-action:hover { background-image: linear-gradient(to bottom, #48BB78, #38A169); }"
         "button.destructive-action { background-image: linear-gradient(to bottom, #E53E3E, #C53030); color: white; }"
         "button.destructive-action:hover { background-image: linear-gradient(to bottom, #FC5858, #E53E3E); }"
         "entry { background-color: white; color: #0F172A; border: 1.5px solid #94A3B8; border-radius: 7px; padding: 7px 12px; }"
         "entry:focus { border-color: #4A9EE7; background-color: white; }"
-        "entry:disabled { background-color: #EDF2F7; color: #A0AEC0; }"
+        "entry:disabled { background-color: #E2E8F0; color: #64748B; }"
         "combobox button { background-image: linear-gradient(to bottom, #FFFFFF, #EDF2F7); color: #0F172A; border: 1.5px solid #94A3B8; border-radius: 7px; padding: 6px 10px; font-weight: normal; }"
         "combobox button:hover { background-image: linear-gradient(to bottom, #EBF4FF, #DBEAFE); }"
+        "combobox box arrow { color: #1E293B; }"
         "scrollbar { background-color: transparent; border: none; padding: 0; }"
         "scrollbar.vertical { min-width: 10px; }"
         "scrollbar.horizontal { min-height: 10px; }"
         "scrollbar slider { background-color: #A8BAC9; border-radius: 5px; min-width: 6px; min-height: 6px; border: 2px solid transparent; }"
         "scrollbar slider:hover { background-color: #718096; }"
         ".view { background-color: white; color: #111827; }"
-        "treeview.view { border: 1px solid #D0D8E0; }"
-        "treeview.view:selected { background-color: #2B6CB0; color: white; }"
-        "treeview header button { background-image: linear-gradient(to bottom, #F7FAFC, #EDF2F7); color: #4A5568; border-bottom: 2px solid #CBD5E0; font-weight: 700; padding: 8px 12px; }"
-        "treeview header button:hover { background-image: linear-gradient(to bottom, #EBF8FF, #DBEAFE); }"
-        "checkbutton check, radiobutton radio { background-color: white; border: 1.5px solid #BDC6CF; border-radius: 4px; }"
+        "treeview.view { background-color: #FFFFFF; color: #0F172A; border: 1px solid #C7D2DE; }"
+        "treeview.view:selected, treeview.view:selected:focus { background-color: #1D4ED8; color: #FFFFFF; }"
+        "treeview.view:hover { color: #0F172A; }"
+        "treeview header button { background-image: linear-gradient(to bottom, #F8FBFD, #DDE7F0); color: #1E293B; border-top: 1px solid #F8FBFD; border-bottom: 2px solid #94A3B8; font-weight: 800; padding: 8px 12px; }"
+        "treeview header button:hover { background-image: linear-gradient(to bottom, #EFF6FF, #DBEAFE); color: #0F172A; }"
+        "treeview header button:active { background-image: linear-gradient(to bottom, #DBEAFE, #BFDBFE); }"
+        "checkbutton check, radiobutton radio { background-color: white; border: 1.5px solid #94A3B8; border-radius: 4px; }"
         "checkbutton check:checked, radiobutton radio:checked { background-color: #2B6CB0; border-color: #2B6CB0; }"
         "label { color: #111827; }"
+        "textview text { background-color: #FFFFFF; color: #111827; }"
         ".heading { font-weight: 700; font-size: 14px; }"
         ".warning { color: #B7770D; font-weight: 700; }"
         ".danger, .balance-due { color: #C53030; font-weight: 700; }"
@@ -1912,8 +2258,10 @@ static void apply_visual_theme(ThemeMode mode) {
         "dialog textview text { background-color: #FFFFFF; }"
         ".dialog-action-area { background-color: #E7EEF5; border-top: 1px solid #B8C6D5; padding: 8px 10px; }"
         "tooltip { background-color: #0F172A; color: #F8FAFC; border: 1px solid #0B1220; }"
-        "notebook tab { background-color: #E2E8F0; color: #718096; padding: 7px 16px; border-radius: 6px 6px 0 0; }"
-        "notebook tab:checked { background-color: white; color: #1A202C; font-weight: 600; }"
+        "notebook header { background-color: #DCE6EF; }"
+        "notebook tab { background-color: #D5E0EA; color: #334155; padding: 7px 16px; border-radius: 6px 6px 0 0; border: 1px solid #B8C6D5; }"
+        "notebook tab:hover { background-color: #E2ECF5; color: #0F172A; }"
+        "notebook tab:checked { background-color: white; color: #0F172A; font-weight: 700; border-bottom-color: white; }"
         "progressbar trough { background-color: #CBD5E0; border-radius: 5px; min-height: 8px; }"
         "progressbar progress { background-image: linear-gradient(to right, #4A9EE7, #38A169); border-radius: 5px; }"
         "spinbutton { background-color: white; color: #1A202C; border: 1.5px solid #BDC6CF; border-radius: 7px; }"
@@ -4346,7 +4694,8 @@ static void web_scraper_utility_dialog(void) {
         "Web Product Scraper - bikeworldiowa.com",
         GTK_WINDOW(main_window),
         GTK_DIALOG_MODAL,
-        "_Refresh Catalog", GTK_RESPONSE_OK,
+        "_Scrape URL", GTK_RESPONSE_OK,
+        "_Import Selected to Store", GTK_RESPONSE_APPLY,
         "_Close", GTK_RESPONSE_CANCEL, NULL);
     
     gtk_window_set_default_size(GTK_WINDOW(dialog), 600, 400);
@@ -4356,7 +4705,6 @@ static void web_scraper_utility_dialog(void) {
     // Status info
     GtkWidget *info_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     GtkWidget *scrape_status = gtk_label_new("Scraper Status: Idle");
-    GtkWidget *products_label = gtk_label_new("Products in Cache:");
     gchar *cache_text = g_strdup_printf("Products in Cache: %d items", scanned_product_count);
     GtkWidget *cache_info = gtk_label_new(cache_text);
     g_free(cache_text);
@@ -4367,6 +4715,10 @@ static void web_scraper_utility_dialog(void) {
     gtk_box_pack_start(GTK_BOX(info_box), cache_info, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(info_box), last_refresh, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(content), info_box, FALSE, FALSE, 5);
+
+    GtkWidget *url_entry = create_labeled_entry("Product URL:", content);
+    gtk_entry_set_placeholder_text(GTK_ENTRY(url_entry), "https://www.bikeworldiowa.com/product/...html");
+    gtk_entry_set_text(GTK_ENTRY(url_entry), "https://www.bikeworldiowa.com/product/trek-quick-connect-front-light-bracket-579134-1.htm");
 
     // Product search/filter
     GtkWidget *search_label = gtk_label_new("Search Scraped Products:");
@@ -4382,21 +4734,9 @@ static void web_scraper_utility_dialog(void) {
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     
-    GtkListStore *store = gtk_list_store_new(6, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_DOUBLE, G_TYPE_STRING, G_TYPE_STRING);
+    GtkListStore *store = gtk_list_store_new(7, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_DOUBLE, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_INT);
     
-    // Populate cached scraped products
-    for (int i = 0; i < scanned_product_count; i++) {
-        GtkTreeIter iter;
-        gtk_list_store_append(store, &iter);
-        gtk_list_store_set(store, &iter,
-                          0, scanned_products[i].sku,
-                          1, scanned_products[i].name,
-                          2, scanned_products[i].category,
-                          3, scanned_products[i].price,
-                          4, scanned_products[i].vendor,
-                          5, scanned_products[i].in_stock ? "In Stock" : "Out of Stock",
-                          -1);
-    }
+    refresh_scraped_products_store(store);
     
     GtkWidget *tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
     GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
@@ -4412,18 +4752,90 @@ static void web_scraper_utility_dialog(void) {
 
     // Info message
     GtkWidget *info_label = gtk_label_new(
-        "Note: Web scraper requires libcurl integration.\n"
-        "This tool demonstrates the UI framework.\n"
-        "Implementation: C libcurl → HTML parsing → ScannedProduct[] array");
+        "Imports one Bike World product page at a time.\n"
+        "Parses JSON-LD metadata plus the Part Numbers table.\n"
+        "Best results: paste a full /product/... URL.");
     gtk_label_set_line_wrap(GTK_LABEL(info_label), TRUE);
     gtk_box_pack_start(GTK_BOX(content), info_label, FALSE, FALSE, 5);
 
     gtk_widget_show_all(content);
 
-    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
-        // TODO: Implement actual scraping with libcurl
-        gtk_label_set_text(GTK_LABEL(scrape_status), "Scraper Status: Fetching bikeworldiowa.com...");
-        gtk_widget_queue_draw(scrape_status);
+    for (;;) {
+        int response = gtk_dialog_run(GTK_DIALOG(dialog));
+        if (response == GTK_RESPONSE_CANCEL || response == GTK_RESPONSE_DELETE_EVENT) break;
+
+        if (response == GTK_RESPONSE_OK) {
+            const char *url = gtk_entry_get_text(GTK_ENTRY(url_entry));
+            char error_msg[256];
+
+            gtk_label_set_text(GTK_LABEL(scrape_status), "Scraper Status: Fetching URL...");
+            while (gtk_events_pending()) gtk_main_iteration();
+
+            if (strstr(url, "/product/")) {
+                ScannedProduct scraped;
+                if (!scrape_bikeworld_product_page(url, &scraped, error_msg, sizeof(error_msg))) {
+                    gtk_label_set_text(GTK_LABEL(scrape_status), "Scraper Status: Import failed.");
+                    show_error_dialog(error_msg);
+                    continue;
+                }
+
+                if (upsert_scraped_product(&scraped) < 0) {
+                    gtk_label_set_text(GTK_LABEL(scrape_status), "Scraper Status: Cache full.");
+                    show_error_dialog("Scraped product cache is full.");
+                    continue;
+                }
+
+                char refresh_line[64];
+                snprintf(refresh_line, sizeof(refresh_line), "Last Refresh: %s", scraped.last_scanned);
+                gtk_label_set_text(GTK_LABEL(last_refresh), refresh_line);
+
+                char status_line[256];
+                snprintf(status_line, sizeof(status_line), "Scraper Status: Imported %s (%s)", scraped.name, scraped.sku);
+                gtk_label_set_text(GTK_LABEL(scrape_status), status_line);
+            } else {
+                int imported = 0;
+                if (!scrape_bikeworld_catalog_page(url, &imported, error_msg, sizeof(error_msg))) {
+                    gtk_label_set_text(GTK_LABEL(scrape_status), "Scraper Status: Bulk import failed.");
+                    show_error_dialog(error_msg);
+                    continue;
+                }
+
+                char status_line[256];
+                snprintf(status_line, sizeof(status_line), "Scraper Status: Imported %d product(s) from list page.", imported);
+                gtk_label_set_text(GTK_LABEL(scrape_status), status_line);
+            }
+
+            refresh_scraped_products_store(store);
+            gchar *cache_line = g_strdup_printf("Products in Cache: %d items", scanned_product_count);
+            gtk_label_set_text(GTK_LABEL(cache_info), cache_line);
+            g_free(cache_line);
+            save_data();
+        } else if (response == GTK_RESPONSE_APPLY) {
+            GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+            GtkTreeIter iter;
+            GtkTreeModel *model = GTK_TREE_MODEL(store);
+            if (!gtk_tree_selection_get_selected(selection, &model, &iter)) {
+                show_error_dialog("Select a scraped product to import.");
+                continue;
+            }
+
+            int scraped_index = -1;
+            gtk_tree_model_get(model, &iter, 6, &scraped_index, -1);
+            if (scraped_index < 0 || scraped_index >= scanned_product_count) {
+                show_error_dialog("Selected scraped product is no longer available.");
+                continue;
+            }
+
+            char import_error[256];
+            if (!import_scanned_product_to_store(&scanned_products[scraped_index], import_error, sizeof(import_error))) {
+                if (strcmp(import_error, "Store selection canceled.") != 0) show_error_dialog(import_error);
+                continue;
+            }
+
+            char status_line[256];
+            snprintf(status_line, sizeof(status_line), "Scraper Status: Sent %s to store inventory.", scanned_products[scraped_index].sku);
+            gtk_label_set_text(GTK_LABEL(scrape_status), status_line);
+        }
     }
     gtk_widget_destroy(dialog);
 }
@@ -6693,7 +7105,33 @@ static void save_data(void) {
         fprintf(f, "%s\n%s\n%s\n%s\n%s\n", s->marketing.proof_email, s->marketing.facebook_url, s->marketing.twitter_url, s->marketing.survey_url, s->marketing.post_purchase_message);
         for (int p = 0; p < s->product_count; p++) {
             Product *pr = &s->products[p];
-            fprintf(f, "%s\n%s\n%s %d %.2f %d %d\n", pr->sku, pr->name, pr->vendor, pr->serialized, pr->price, pr->stock, pr->sold);
+            fprintf(f, "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%d %.2f %.2f %.2f %.2f %d %d %d %d %d %d %d %d %d %d %d\n",
+                    pr->sku,
+                    pr->name,
+                    pr->vendor,
+                    pr->brand,
+                    pr->upc,
+                    pr->manufacturer_part_number,
+                    pr->style_name,
+                    pr->style_number,
+                    pr->color,
+                    pr->size,
+                    pr->model_year,
+                    pr->msrp,
+                    pr->price,
+                    pr->average_cost,
+                    pr->last_cost,
+                    pr->serialized,
+                    pr->ecommerce_sync,
+                    pr->stock,
+                    pr->on_order_qty,
+                    pr->received_qty,
+                    pr->committed_qty,
+                    pr->min_on_season,
+                    pr->max_on_season,
+                    pr->min_off_season,
+                    pr->max_off_season,
+                    pr->sold);
         }
         for (int d = 0; d < s->day_count; d++) fprintf(f, "%.2f\n", s->daily_sales[d]);
         for (int q = 0; q < s->quote_count; q++) {
@@ -6892,6 +7330,21 @@ static void save_data(void) {
         fprintf(f, "%s\n%s\n%s\n", q->transaction_id, q->sku, q->created_at);
     }
 
+    fprintf(f, "SCRAPED_PRODUCTS\n%d\n", scanned_product_count);
+    for (int i = 0; i < scanned_product_count; i++) {
+        ScannedProduct *p = &scanned_products[i];
+        fprintf(f, "%.2f %d\n", p->price, p->in_stock);
+        fprintf(f, "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n",
+                p->sku,
+                p->name,
+                p->category,
+                p->vendor,
+                p->url,
+                p->upc,
+                p->manufacturer_part_number,
+                p->last_scanned);
+    }
+
     fprintf(f, "SYSTEM_CONFIG\n%d\n%d\n%s\n%s\n", enable_multistore_sync, trek_auto_register, current_sales_user, system_sales_popup_message);
     fprintf(f, "ADV|%.4f|%.2f|%d|%d|%d|%d|%d\n",
             app_settings.default_tax_rate,
@@ -6953,26 +7406,37 @@ static void load_data(void) {
             pr->name[strcspn(pr->name, "\n")] = '\0';
             if (!fgets(pr->vendor, NAME_LEN, f)) break;
             pr->vendor[strcspn(pr->vendor, "\n")] = '\0';
-            fscanf(f, "%d %lf %d %d\n", &pr->serialized, &pr->price, &pr->stock, &pr->sold);
-            pr->brand[0] = '\0';
-            pr->upc[0] = '\0';
-            pr->manufacturer_part_number[0] = '\0';
-            pr->style_name[0] = '\0';
-            pr->style_number[0] = '\0';
-            pr->model_year = 0;
-            pr->color[0] = '\0';
-            pr->size[0] = '\0';
-            pr->msrp = pr->price;
-            pr->average_cost = 0.0;
-            pr->last_cost = 0.0;
-            pr->ecommerce_sync = 0;
-            pr->on_order_qty = 0;
-            pr->received_qty = 0;
-            pr->committed_qty = 0;
-            pr->min_on_season = 0;
-            pr->max_on_season = 0;
-            pr->min_off_season = 0;
-            pr->max_off_season = 0;
+            if (!fgets(pr->brand, NAME_LEN, f)) break;
+            pr->brand[strcspn(pr->brand, "\n")] = '\0';
+            if (!fgets(pr->upc, NAME_LEN, f)) break;
+            pr->upc[strcspn(pr->upc, "\n")] = '\0';
+            if (!fgets(pr->manufacturer_part_number, NAME_LEN, f)) break;
+            pr->manufacturer_part_number[strcspn(pr->manufacturer_part_number, "\n")] = '\0';
+            if (!fgets(pr->style_name, NAME_LEN, f)) break;
+            pr->style_name[strcspn(pr->style_name, "\n")] = '\0';
+            if (!fgets(pr->style_number, NAME_LEN, f)) break;
+            pr->style_number[strcspn(pr->style_number, "\n")] = '\0';
+            if (!fgets(pr->color, NAME_LEN, f)) break;
+            pr->color[strcspn(pr->color, "\n")] = '\0';
+            if (!fgets(pr->size, NAME_LEN, f)) break;
+            pr->size[strcspn(pr->size, "\n")] = '\0';
+            fscanf(f, "%d %.2f %.2f %.2f %.2f %d %d %d %d %d %d %d %d %d %d %d\n",
+                   &pr->model_year,
+                   &pr->msrp,
+                   &pr->price,
+                   &pr->average_cost,
+                   &pr->last_cost,
+                   &pr->serialized,
+                   &pr->ecommerce_sync,
+                   &pr->stock,
+                   &pr->on_order_qty,
+                   &pr->received_qty,
+                   &pr->committed_qty,
+                   &pr->min_on_season,
+                   &pr->max_on_season,
+                   &pr->min_off_season,
+                   &pr->max_off_season,
+                   &pr->sold);
         }
         for (int d = 0; d < s->day_count; d++) fscanf(f, "%lf\n", &s->daily_sales[d]);
 
@@ -7122,6 +7586,7 @@ static void load_data(void) {
     web_order_pickup_count = 0;
     suspension_log_count = 0;
     sync_queue_count = 0;
+    scanned_product_count = 0;
     for (int i = 0; i < MAX_REPAIR_STANDS; i++) {
         repair_stands[i].stand_number = i + 1;
         repair_stands[i].work_order_id = 0;
@@ -7702,6 +8167,49 @@ static void load_data(void) {
                     strncpy(q->transaction_id, txn, NAME_LEN - 1);
                     strncpy(q->sku, sku, NAME_LEN - 1);
                     strncpy(q->created_at, created, NAME_LEN - 1);
+                }
+            }
+        } else if (strcmp(section_name, "SCRAPED_PRODUCTS") == 0) {
+            int count = 0;
+            if (fscanf(f, "%d\n", &count) != 1) break;
+            int limit = (count < MAX_QBP_CATALOG_ITEMS) ? count : MAX_QBP_CATALOG_ITEMS;
+            scanned_product_count = limit;
+            for (int i = 0; i < count; i++) {
+                double price = 0.0;
+                int in_stock = 0;
+                char sku[NAME_LEN], name[NAME_LEN], category[NAME_LEN], vendor[NAME_LEN];
+                char url[NAME_LEN * 2], upc[NAME_LEN], mpn[NAME_LEN], scanned[NAME_LEN];
+                if (fscanf(f, "%lf %d\n", &price, &in_stock) != 2) break;
+                if (!fgets(sku, sizeof(sku), f)) break;
+                if (!fgets(name, sizeof(name), f)) break;
+                if (!fgets(category, sizeof(category), f)) break;
+                if (!fgets(vendor, sizeof(vendor), f)) break;
+                if (!fgets(url, sizeof(url), f)) break;
+                if (!fgets(upc, sizeof(upc), f)) break;
+                if (!fgets(mpn, sizeof(mpn), f)) break;
+                if (!fgets(scanned, sizeof(scanned), f)) break;
+                sku[strcspn(sku, "\n")] = '\0';
+                name[strcspn(name, "\n")] = '\0';
+                category[strcspn(category, "\n")] = '\0';
+                vendor[strcspn(vendor, "\n")] = '\0';
+                url[strcspn(url, "\n")] = '\0';
+                upc[strcspn(upc, "\n")] = '\0';
+                mpn[strcspn(mpn, "\n")] = '\0';
+                scanned[strcspn(scanned, "\n")] = '\0';
+
+                if (i < limit) {
+                    ScannedProduct *p = &scanned_products[i];
+                    memset(p, 0, sizeof(*p));
+                    p->price = price;
+                    p->in_stock = in_stock;
+                    strncpy(p->sku, sku, NAME_LEN - 1);
+                    strncpy(p->name, name, NAME_LEN - 1);
+                    strncpy(p->category, category, NAME_LEN - 1);
+                    strncpy(p->vendor, vendor, NAME_LEN - 1);
+                    strncpy(p->url, url, sizeof(p->url) - 1);
+                    strncpy(p->upc, upc, NAME_LEN - 1);
+                    strncpy(p->manufacturer_part_number, mpn, NAME_LEN - 1);
+                    strncpy(p->last_scanned, scanned, NAME_LEN - 1);
                 }
             }
         } else if (strcmp(section_name, "SYSTEM_CONFIG") == 0) {
