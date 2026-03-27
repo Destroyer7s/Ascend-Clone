@@ -150,6 +150,11 @@ typedef struct {
 } TimeClockEntry;
 
 typedef struct {
+    int prompt_work_order_serial;
+    int prompt_receiving_serial;
+} AppSettings;
+
+typedef struct {
     char name[NAME_LEN];
     char location[NAME_LEN];
     double monthly_goal;
@@ -176,6 +181,7 @@ static TaxExceptionReason tax_exceptions[MAX_TAX_EXCEPTIONS];
 static int tax_exception_count = 0;
 static TimeClockEntry time_clock_entries[MAX_TIME_CLOCK_ENTRIES];
 static int time_clock_count = 0;
+static AppSettings app_settings = {1, 1};
 static GtkWidget *main_window;
 static GtkWidget *status_label;
 
@@ -233,6 +239,9 @@ static void on_refresh_time_clock_clicked(GtkButton *button, gpointer data);
 static void time_clock_report_dialog(void);
 static void refresh_time_clock_report(GtkWidget *dialog);
 static void on_refresh_time_clock_report_clicked(GtkButton *button, gpointer data);
+static void work_order_defaults_dialog(void);
+static void ordering_serial_prompt_dialog(void);
+static int prompt_for_serial_number_dialog(const char *title, const char *context, char *out_serial, size_t out_size);
 static void special_order_prompt_dialog(Store *s, const char *sku, int qty, int *is_special_order, char *comments);
 static void reorder_list_dialog(void);
 static void special_orders_on_order_report(void);
@@ -579,6 +588,25 @@ static void show_main_menu(void) {
     g_signal_connect(return_item, "activate", G_CALLBACK(create_return_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(sales_menu), return_item);
 
+    // Options menu
+    GtkWidget *options_menu = gtk_menu_new();
+    GtkWidget *options_item = gtk_menu_item_new_with_label("Options");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(options_item), options_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), options_item);
+
+    GtkWidget *sales_returns_menu = gtk_menu_new();
+    GtkWidget *sales_returns_item = gtk_menu_item_new_with_label("Sales and Returns");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(sales_returns_item), sales_returns_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(options_menu), sales_returns_item);
+
+    GtkWidget *work_order_defaults_item = gtk_menu_item_new_with_label("Work Order Defaults");
+    g_signal_connect(work_order_defaults_item, "activate", G_CALLBACK(work_order_defaults_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(sales_returns_menu), work_order_defaults_item);
+
+    GtkWidget *ordering_item = gtk_menu_item_new_with_label("Ordering");
+    g_signal_connect(ordering_item, "activate", G_CALLBACK(ordering_serial_prompt_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(options_menu), ordering_item);
+
     GtkWidget *special_orders_item = gtk_menu_item_new_with_label("Special Ordered Items");
     g_signal_connect(special_orders_item, "activate", G_CALLBACK(view_special_orders_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), special_orders_item);
@@ -753,6 +781,95 @@ static void customer_tax_exceptions_dialog(void) {
 
     gtk_widget_show_all(dialog);
     gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static int prompt_for_serial_number_dialog(const char *title, const char *context, char *out_serial, size_t out_size) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(title,
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Save", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new(context), FALSE, FALSE, 0);
+    GtkWidget *serial_entry = create_labeled_entry("Serial Number:", vbox);
+
+    gtk_widget_show_all(dialog);
+    int accepted = 0;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char *serial = gtk_entry_get_text(GTK_ENTRY(serial_entry));
+        if (serial && strlen(serial) > 0) {
+            strncpy(out_serial, serial, out_size - 1);
+            out_serial[out_size - 1] = '\0';
+            accepted = 1;
+        } else {
+            show_error_dialog("Serial Number is required for serialized items.");
+        }
+    }
+    gtk_widget_destroy(dialog);
+    return accepted;
+}
+
+static void work_order_defaults_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Work Order Defaults",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_OK", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *prompt_check = gtk_check_button_new_with_label("Prompt for Serial Number");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(prompt_check), app_settings.prompt_work_order_serial);
+    gtk_box_pack_start(GTK_BOX(vbox), prompt_check, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(vbox),
+        gtk_label_new("Disabling this prompt means serial numbers/descriptions must be associated manually in Work Order Details."),
+        FALSE, FALSE, 0);
+
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        app_settings.prompt_work_order_serial = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(prompt_check));
+        save_data();
+        show_info_dialog("Work Order defaults updated.");
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void ordering_serial_prompt_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Ordering Options",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_OK", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *receiving_check = gtk_check_button_new_with_label("Prompt for Serial Number when Receiving");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(receiving_check), app_settings.prompt_receiving_serial);
+    gtk_box_pack_start(GTK_BOX(vbox), receiving_check, FALSE, FALSE, 0);
+
+    GtkWidget *cannot_disable = gtk_label_new("Note: Prompt to associate a serial number at time of sale cannot be disabled.");
+    gtk_label_set_line_wrap(GTK_LABEL(cannot_disable), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), cannot_disable, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        app_settings.prompt_receiving_serial = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(receiving_check));
+        save_data();
+        show_info_dialog("Ordering options updated.");
+    }
     gtk_widget_destroy(dialog);
 }
 
@@ -1832,6 +1949,10 @@ static void save_data(void) {
                 e->hidden);
     }
 
+        fprintf(f, "APP_SETTINGS\n%d %d\n",
+            app_settings.prompt_work_order_serial,
+            app_settings.prompt_receiving_serial);
+
     fclose(f);
 }
 
@@ -2007,6 +2128,8 @@ static void load_data(void) {
 
     tax_exception_count = 0;
     time_clock_count = 0;
+    app_settings.prompt_work_order_serial = 1;
+    app_settings.prompt_receiving_serial = 1;
 
     char section_name[NAME_LEN];
     while (fscanf(f, "%63s", section_name) == 1) {
@@ -2063,6 +2186,13 @@ static void load_data(void) {
                     e->end_time[NAME_LEN - 1] = '\0';
                     e->hidden = hidden;
                 }
+            }
+        } else if (strcmp(section_name, "APP_SETTINGS") == 0) {
+            int work_prompt = 1;
+            int recv_prompt = 1;
+            if (fscanf(f, "%d %d\n", &work_prompt, &recv_prompt) == 2) {
+                app_settings.prompt_work_order_serial = work_prompt;
+                app_settings.prompt_receiving_serial = recv_prompt;
             }
         } else {
             break;
@@ -2461,6 +2591,16 @@ static void create_sale_dialog(void) {
                     int qty = atoi(qty_str);
                     int is_special_order = 0;
                     char so_comments[NAME_LEN] = "";
+                    char sale_serial[NAME_LEN] = "";
+
+                    if (p->serialized) {
+                        char serial_ctx[200];
+                        sprintf(serial_ctx, "Product: %s\nSKU: %s\n\nSerial number capture at time of sale is required.", p->name, p->sku);
+                        if (!prompt_for_serial_number_dialog("Enter Serial Number", serial_ctx, sale_serial, sizeof(sale_serial))) {
+                            gtk_widget_destroy(prod_dialog);
+                            continue;
+                        }
+                    }
 
                     // Check if out of stock
                     if (p->stock < qty) {
@@ -2473,6 +2613,8 @@ static void create_sale_dialog(void) {
                     txn.is_special_order[txn.item_count] = is_special_order;
                     if (is_special_order) {
                         strncpy(txn.so_comments[txn.item_count], so_comments, NAME_LEN - 1);
+                    } else if (p->serialized) {
+                        strncpy(txn.so_comments[txn.item_count], sale_serial, NAME_LEN - 1);
                     }
                     txn.total += p->price * qty;
                     txn.item_count++;
@@ -2788,6 +2930,16 @@ static void create_layaway_dialog(void) {
                     int qty = atoi(qty_str);
                     int is_special_order = 0;
                     char so_comments[NAME_LEN] = "";
+                    char sale_serial[NAME_LEN] = "";
+
+                    if (p->serialized) {
+                        char serial_ctx[200];
+                        sprintf(serial_ctx, "Product: %s\nSKU: %s\n\nSerial number capture at time of sale is required.", p->name, p->sku);
+                        if (!prompt_for_serial_number_dialog("Enter Serial Number", serial_ctx, sale_serial, sizeof(sale_serial))) {
+                            gtk_widget_destroy(prod_dialog);
+                            continue;
+                        }
+                    }
 
                     // Check if out of stock
                     if (p->stock < qty) {
@@ -2800,6 +2952,8 @@ static void create_layaway_dialog(void) {
                     txn.is_special_order[txn.item_count] = is_special_order;
                     if (is_special_order) {
                         strncpy(txn.so_comments[txn.item_count], so_comments, NAME_LEN - 1);
+                    } else if (p->serialized) {
+                        strncpy(txn.so_comments[txn.item_count], sale_serial, NAME_LEN - 1);
                     }
                     txn.total += p->price * qty;
                     txn.item_count++;
@@ -4263,6 +4417,28 @@ static void mark_special_orders_received(GtkWidget *widget, gpointer data) {
         if (store && so_index >= 0 && so_index < store->special_order_count) {
             SpecialOrder *so = &store->special_orders[so_index];
             if (so->status == SO_STATUS_ON_ORDER) {
+                int requires_serial = 0;
+                Product *p = NULL;
+                for (int j = 0; j < store->product_count; j++) {
+                    if (strcmp(store->products[j].sku, so->product_sku) == 0) {
+                        p = &store->products[j];
+                        break;
+                    }
+                }
+                if (p && p->serialized) requires_serial = 1;
+
+                if (requires_serial && app_settings.prompt_receiving_serial) {
+                    char serial_ctx[256];
+                    char serial_number[NAME_LEN] = "";
+                    sprintf(serial_ctx, "Receiving serialized product\nProduct: %s\nSKU: %s", p->name, so->product_sku);
+                    if (!prompt_for_serial_number_dialog("Serial Number when Receiving", serial_ctx, serial_number, sizeof(serial_number))) {
+                        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(store_list), &iter);
+                        continue;
+                    }
+                    strncpy(so->serial_number, serial_number, NAME_LEN - 1);
+                    so->serial_number[NAME_LEN - 1] = '\0';
+                }
+
                 so->status = SO_STATUS_RECEIVED;
                 // Set received date to today
                 time_t now = time(NULL);
