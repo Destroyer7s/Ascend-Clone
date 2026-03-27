@@ -207,6 +207,7 @@ typedef struct {
 static Tile tiles[MAX_TILES];
 static int tile_count = 11;
 static int desktop_locked = 1;
+static int tiles_initialized = 0;
 static int dragging_tile = -1;
 static int drag_start_x, drag_start_y;
 static GtkWidget *desktop_canvas = NULL;
@@ -248,6 +249,10 @@ static void low_stock_report_dialog(void);
 static void on_export_low_stock_report_clicked(GtkButton *button, gpointer data);
 static void best_selling_items_report_dialog(void);
 static void instructions_reference_dialog(void);
+static void customize_desktop_tiles_dialog(void);
+static void set_desktop_locked(int locked);
+static void on_lock_desktop_clicked(GtkMenuItem *item, gpointer data);
+static void on_unlock_desktop_clicked(GtkMenuItem *item, gpointer data);
 static void work_order_defaults_dialog(void);
 static void ordering_serial_prompt_dialog(void);
 static int prompt_for_serial_number_dialog(const char *title, const char *context, char *out_serial, size_t out_size);
@@ -265,6 +270,8 @@ static void show_trend_dialog(void);
 static void save_data(void);
 static void load_data(void);
 static void execute_tile_action(TileType type);
+static void show_info_dialog(const char *message);
+static void show_error_dialog(const char *message);
 static void trek_marketing_settings_dialog(void);
 static void show_trend_dialog(void);
 static void save_data(void);
@@ -292,6 +299,99 @@ static GtkWidget* create_labeled_entry(const char *label_text, GtkWidget *contai
     gtk_box_pack_start(GTK_BOX(container), hbox, FALSE, FALSE, 0);
 
     return entry;
+}
+
+static void set_desktop_locked(int locked) {
+    desktop_locked = locked;
+    if (status_label) {
+        gtk_label_set_text(GTK_LABEL(status_label),
+                          locked ? "Ready (Desktop Locked)" : "Ready (Desktop Unlocked - Drag tiles)");
+    }
+    if (desktop_canvas) gtk_widget_queue_draw(desktop_canvas);
+}
+
+static void on_lock_desktop_clicked(GtkMenuItem *item, gpointer data) {
+    (void)item;
+    (void)data;
+    set_desktop_locked(1);
+}
+
+static void on_unlock_desktop_clicked(GtkMenuItem *item, gpointer data) {
+    (void)item;
+    (void)data;
+    set_desktop_locked(0);
+}
+
+static void customize_desktop_tiles_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Customize Home Screen Tiles",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Apply", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    gtk_box_pack_start(GTK_BOX(vbox),
+                       gtk_label_new("Show/hide tiles and choose tile color for visible tiles."),
+                       FALSE, FALSE, 0);
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(sw, 620, 360);
+    gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+    gtk_container_add(GTK_CONTAINER(sw), grid);
+
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Tile"), 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Show"), 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Color"), 2, 0, 1, 1);
+
+    GtkWidget *visible_checks[MAX_TILES];
+    GtkWidget *color_combos[MAX_TILES];
+
+    for (int i = 0; i < tile_count; i++) {
+        GtkWidget *lbl = gtk_label_new(tiles[i].label);
+        GtkWidget *show_cb = gtk_check_button_new();
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(show_cb), tiles[i].visible);
+
+        GtkWidget *color_combo = gtk_combo_box_text_new();
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(color_combo), "Light Blue");
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(color_combo), "Dark Blue");
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(color_combo), "Green");
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(color_combo), "Orange");
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(color_combo), "Slate");
+        gtk_combo_box_set_active(GTK_COMBO_BOX(color_combo), tiles[i].color);
+
+        visible_checks[i] = show_cb;
+        color_combos[i] = color_combo;
+
+        gtk_grid_attach(GTK_GRID(grid), lbl, 0, i + 1, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), show_cb, 1, i + 1, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), color_combo, 2, i + 1, 1, 1);
+    }
+
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        for (int i = 0; i < tile_count; i++) {
+            tiles[i].visible = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(visible_checks[i]));
+            tiles[i].color = gtk_combo_box_get_active(GTK_COMBO_BOX(color_combos[i]));
+            if (tiles[i].color < COLOR_LIGHT_BLUE || tiles[i].color > COLOR_SLATE) {
+                tiles[i].color = COLOR_LIGHT_BLUE;
+            }
+        }
+        save_data();
+        if (desktop_canvas) gtk_widget_queue_draw(desktop_canvas);
+        show_info_dialog("Desktop tile settings updated.");
+    }
+
+    gtk_widget_destroy(dialog);
 }
 
 // Utility function to show info dialog
@@ -410,45 +510,7 @@ static gboolean on_desktop_button_press(GtkWidget *widget, GdkEventButton *event
             }
         }
     } else if (event->button == 3) {
-        if (desktop_locked) {
-            GtkWidget *menu = gtk_menu_new();
-            GtkWidget *item_unlock = gtk_menu_item_new_with_label("Unlock Desktop");
-            gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_unlock);
-            g_signal_connect_swapped(item_unlock, "activate", G_CALLBACK(gtk_menu_item_activate), item_unlock);
-            gtk_widget_show_all(menu);
-            gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
-            desktop_locked = 0;
-            gtk_label_set_text(GTK_LABEL(status_label), "Ready (Desktop Unlocked - Drag tiles)");
-            gtk_widget_queue_draw(widget);
-        } else {
-            int tile_idx = find_tile_at(event->x, event->y);
-            if (tile_idx >= 0) {
-                GtkWidget *menu = gtk_menu_new();
-                GtkWidget *item_small = gtk_menu_item_new_with_label("Size: Small");
-                GtkWidget *item_wide = gtk_menu_item_new_with_label("Size: Wide");
-                GtkWidget *item_large = gtk_menu_item_new_with_label("Size: Large");
-                GtkWidget *item_color = gtk_menu_item_new_with_label("Change Color");
-                GtkWidget *item_hide = gtk_menu_item_new_with_label("Hide Tile");
-
-                gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_small);
-                gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_wide);
-                gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_large);
-                gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_color);
-                gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_hide);
-
-                gtk_widget_show_all(menu);
-                gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
-            } else {
-                GtkWidget *menu = gtk_menu_new();
-                GtkWidget *item_lock = gtk_menu_item_new_with_label("Lock Desktop");
-                gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_lock);
-                gtk_widget_show_all(menu);
-                gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
-                desktop_locked = 1;
-                gtk_label_set_text(GTK_LABEL(status_label), "Ready (Desktop Locked)");
-                gtk_widget_queue_draw(widget);
-            }
-        }
+        set_desktop_locked(!desktop_locked);
     }
     return FALSE;
 }
@@ -464,6 +526,7 @@ static gboolean on_desktop_motion(GtkWidget *widget, GdkEventMotion *event, gpoi
 
 static gboolean on_desktop_button_release(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
     dragging_tile = -1;
+    save_data();
     return FALSE;
 }
 
@@ -521,6 +584,30 @@ static void on_inventory_clicked(GtkButton *button, gpointer user_data) {
     manage_inventory_dialog();
 }
 
+static void on_customers_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    (void)user_data;
+    manage_customers_dialog();
+}
+
+static void on_sales_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    (void)user_data;
+    create_sale_dialog();
+}
+
+static void on_return_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    (void)user_data;
+    create_return_dialog();
+}
+
+static void on_layaway_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    (void)user_data;
+    create_layaway_dialog();
+}
+
 static void on_business_clicked(GtkButton *button, gpointer user_data) {
     business_menu_dialog();
 }
@@ -553,7 +640,10 @@ static gboolean on_main_window_key_press(GtkWidget *widget, GdkEventKey *event, 
 
 // Create the main menu
 static void show_main_menu(void) {
-    init_default_tiles();
+    if (!tiles_initialized) {
+        init_default_tiles();
+        tiles_initialized = 1;
+    }
 
     // Clear main window
     GList *children = gtk_container_get_children(GTK_CONTAINER(main_window));
@@ -586,6 +676,81 @@ static void show_main_menu(void) {
     GtkWidget *time_clock_item = gtk_menu_item_new_with_label("Time Clock");
     g_signal_connect(time_clock_item, "activate", G_CALLBACK(time_clock_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), time_clock_item);
+
+    GtkWidget *desktop_menu = gtk_menu_new();
+    GtkWidget *desktop_item = gtk_menu_item_new_with_label("Desktop");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(desktop_item), desktop_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), desktop_item);
+
+    GtkWidget *unlock_desktop_item = gtk_menu_item_new_with_label("Unlock Desktop (Drag Tiles)");
+    g_signal_connect(unlock_desktop_item, "activate", G_CALLBACK(on_unlock_desktop_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(desktop_menu), unlock_desktop_item);
+
+    GtkWidget *lock_desktop_item = gtk_menu_item_new_with_label("Lock Desktop");
+    g_signal_connect(lock_desktop_item, "activate", G_CALLBACK(on_lock_desktop_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(desktop_menu), lock_desktop_item);
+
+    GtkWidget *customize_tiles_item = gtk_menu_item_new_with_label("Customize Home Tiles (Show/Hide/Color)");
+    g_signal_connect(customize_tiles_item, "activate", G_CALLBACK(customize_desktop_tiles_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(desktop_menu), customize_tiles_item);
+
+    // Main menu (all home-screen actions)
+    GtkWidget *main_menu = gtk_menu_new();
+    GtkWidget *main_item = gtk_menu_item_new_with_label("Main");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(main_item), main_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), main_item);
+
+    GtkWidget *main_add_store = gtk_menu_item_new_with_label("Add Store");
+    g_signal_connect(main_add_store, "activate", G_CALLBACK(on_add_store_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_add_store);
+
+    GtkWidget *main_list_stores = gtk_menu_item_new_with_label("List Stores");
+    g_signal_connect(main_list_stores, "activate", G_CALLBACK(on_list_stores_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_list_stores);
+
+    GtkWidget *main_store_info = gtk_menu_item_new_with_label("Store Info");
+    g_signal_connect(main_store_info, "activate", G_CALLBACK(on_store_info_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_store_info);
+
+    GtkWidget *main_inventory = gtk_menu_item_new_with_label("Inventory");
+    g_signal_connect(main_inventory, "activate", G_CALLBACK(on_inventory_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_inventory);
+
+    GtkWidget *main_customers = gtk_menu_item_new_with_label("Customers");
+    g_signal_connect(main_customers, "activate", G_CALLBACK(on_customers_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_customers);
+
+    GtkWidget *main_sales = gtk_menu_item_new_with_label("Sales");
+    g_signal_connect(main_sales, "activate", G_CALLBACK(on_sales_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_sales);
+
+    GtkWidget *main_return = gtk_menu_item_new_with_label("Return");
+    g_signal_connect(main_return, "activate", G_CALLBACK(on_return_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_return);
+
+    GtkWidget *main_layaway = gtk_menu_item_new_with_label("Layaway");
+    g_signal_connect(main_layaway, "activate", G_CALLBACK(on_layaway_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_layaway);
+
+    GtkWidget *main_business = gtk_menu_item_new_with_label("Business");
+    g_signal_connect(main_business, "activate", G_CALLBACK(on_business_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_business);
+
+    GtkWidget *main_trend = gtk_menu_item_new_with_label("Trend Chart");
+    g_signal_connect(main_trend, "activate", G_CALLBACK(on_trend_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_trend);
+
+    GtkWidget *main_save = gtk_menu_item_new_with_label("Save Data");
+    g_signal_connect(main_save, "activate", G_CALLBACK(on_save_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_save);
+
+    GtkWidget *main_load = gtk_menu_item_new_with_label("Load Data");
+    g_signal_connect(main_load, "activate", G_CALLBACK(on_load_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_load);
+
+    GtkWidget *main_exit = gtk_menu_item_new_with_label("Exit");
+    g_signal_connect(main_exit, "activate", G_CALLBACK(on_exit_clicked), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(main_menu), main_exit);
 
     // Sales menu
     GtkWidget *sales_menu = gtk_menu_new();
@@ -2469,6 +2634,18 @@ static void save_data(void) {
             app_settings.prompt_work_order_serial,
             app_settings.prompt_receiving_serial);
 
+    fprintf(f, "TILE_LAYOUT\n%d\n", tile_count);
+    for (int i = 0; i < tile_count; i++) {
+        fprintf(f, "%d %d %d %d %d %d %d\n",
+                tiles[i].type,
+                tiles[i].x,
+                tiles[i].y,
+                tiles[i].width,
+                tiles[i].height,
+                tiles[i].color,
+                tiles[i].visible);
+    }
+
     fclose(f);
 }
 
@@ -2647,6 +2824,11 @@ static void load_data(void) {
     app_settings.prompt_work_order_serial = 1;
     app_settings.prompt_receiving_serial = 1;
 
+    if (!tiles_initialized) {
+        init_default_tiles();
+        tiles_initialized = 1;
+    }
+
     char section_name[NAME_LEN];
     while (fscanf(f, "%63s", section_name) == 1) {
         if (strcmp(section_name, "TAX_EXCEPTIONS") == 0) {
@@ -2709,6 +2891,24 @@ static void load_data(void) {
             if (fscanf(f, "%d %d\n", &work_prompt, &recv_prompt) == 2) {
                 app_settings.prompt_work_order_serial = work_prompt;
                 app_settings.prompt_receiving_serial = recv_prompt;
+            }
+        } else if (strcmp(section_name, "TILE_LAYOUT") == 0) {
+            int count = 0;
+            if (fscanf(f, "%d\n", &count) != 1) break;
+            for (int i = 0; i < count; i++) {
+                int type = 0, x = 0, y = 0, w = 0, h = 0, color = 0, visible = 1;
+                if (fscanf(f, "%d %d %d %d %d %d %d\n", &type, &x, &y, &w, &h, &color, &visible) != 7) break;
+                for (int t = 0; t < tile_count; t++) {
+                    if (tiles[t].type == (TileType)type) {
+                        tiles[t].x = x;
+                        tiles[t].y = y;
+                        tiles[t].width = w;
+                        tiles[t].height = h;
+                        tiles[t].color = (color >= COLOR_LIGHT_BLUE && color <= COLOR_SLATE) ? (TileColor)color : COLOR_LIGHT_BLUE;
+                        tiles[t].visible = visible ? 1 : 0;
+                        break;
+                    }
+                }
             }
         } else {
             break;
