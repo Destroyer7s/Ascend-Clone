@@ -20,6 +20,7 @@
 #define MAX_RESERVATIONS 3000
 #define MAX_PAYMENT_ENTRIES 12000
 #define MAX_PURCHASE_ORDERS 4000
+#define MAX_VENDOR_LINKS 6000
 #define NAME_LEN 64
 #define MAX_DAYS 30
 
@@ -59,6 +60,11 @@ typedef struct {
     int preferred_contact; // 0=email, 1=phone1, 2=phone2
     int hidden;
     char notes[NAME_LEN * 2];
+    char gender[NAME_LEN];
+    char birthdate[NAME_LEN];
+    char customer_since[NAME_LEN];
+    char last_visit[NAME_LEN];
+    char customer_group[NAME_LEN];
 } Customer;
 
 /* Product: an item tracked in inventory with SKU and price stock information. */
@@ -66,9 +72,28 @@ typedef struct {
     char sku[NAME_LEN];      // internal stock keeping unit
     char name[NAME_LEN];     // human-readable product name
     char vendor[NAME_LEN];   // vendor name
+    char brand[NAME_LEN];
+    char upc[NAME_LEN];
+    char manufacturer_part_number[NAME_LEN];
+    char style_name[NAME_LEN];
+    char style_number[NAME_LEN];
+    int model_year;
+    char color[NAME_LEN];
+    char size[NAME_LEN];
     int serialized;          // 1=yes (serialized/bike), 0=no
+    double msrp;
     double price;            // unit retail price
+    double average_cost;
+    double last_cost;
+    int ecommerce_sync;
     int stock;               // current available on hand in store
+    int on_order_qty;
+    int received_qty;
+    int committed_qty;
+    int min_on_season;
+    int max_on_season;
+    int min_off_season;
+    int max_off_season;
     int sold;                // cumulative sold count (not decremented)
 } Product;
 
@@ -164,6 +189,8 @@ typedef struct {
     int layaway_grace_days;
     double layaway_cancel_fee_percent;
     int layaway_auto_cancel_enabled;
+    double default_tax_rate;
+    double max_discount_percent_sales;
 } AppSettings;
 
 typedef struct {
@@ -239,7 +266,18 @@ typedef struct {
     int hidden;
 } PurchaseOrder;
 
-typedef enum { ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MECHANIC } UserRole;
+typedef struct {
+    int store_idx;
+    char in_store_sku[NAME_LEN];
+    char vendor_name[NAME_LEN];
+    char vendor_product_code[NAME_LEN];
+    char vendor_description[NAME_LEN * 2];
+    int hidden;
+} VendorProductLink;
+
+typedef enum { ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MECHANIC, ROLE_INVENTORY_MANAGER } UserRole;
+
+typedef enum { THEME_LIGHT, THEME_DARK, THEME_SMART } ThemeMode;
 
 typedef struct {
     char name[NAME_LEN];
@@ -283,9 +321,18 @@ static int payment_entry_count = 0;
 static PurchaseOrder purchase_orders[MAX_PURCHASE_ORDERS];
 static int purchase_order_count = 0;
 static int next_purchase_order_id = 8000;
+static VendorProductLink vendor_links[MAX_VENDOR_LINKS];
+static int vendor_link_count = 0;
 static UserRole active_user_role = ROLE_MANAGER;
 static char manager_override_pin[NAME_LEN] = "2468";
-static AppSettings app_settings = {1, 1, 7, 10, 15.0, 0};
+static AppSettings app_settings = {1, 1, 7, 10, 15.0, 0, 0.0825, 15.0};
+static char system_sales_popup_message[NAME_LEN * 3] = "Verify info for registration.";
+static char current_sales_user[NAME_LEN] = "Ascend User";
+static int enable_multistore_sync = 1;
+static int trek_auto_register = 1;
+static ThemeMode active_theme_mode = THEME_SMART;
+static int mobile_floor_mode_enabled = 0;
+static GtkCssProvider *app_css_provider = NULL;
 static GtkWidget *main_window;
 static GtkWidget *status_label;
 
@@ -348,6 +395,7 @@ typedef struct {
     GtkWidget *shipping_entry;
     GtkWidget *discount_entry;
     GtkWidget *tax_rate_combo;
+    GtkWidget *tax_rate_entry;
     GtkWidget *payments_label;
     GtkWidget *balance_label;
     GtkWidget *created_label;
@@ -393,6 +441,7 @@ static void time_clock_report_dialog(void);
 static void refresh_time_clock_report(GtkWidget *dialog);
 static void on_refresh_time_clock_report_clicked(GtkButton *button, gpointer data);
 static void on_export_time_clock_report_clicked(GtkButton *button, gpointer data);
+static void get_today_date(char *out, size_t out_size);
 static void daily_sales_payment_report_dialog(void);
 static void refresh_daily_sales_payment_report(GtkWidget *dialog);
 static void on_refresh_daily_sales_payment_report_clicked(GtkButton *button, gpointer data);
@@ -460,14 +509,36 @@ static void payment_ledger_report_dialog(void);
 static void create_purchase_order_dialog(void);
 static void receive_purchase_order_dialog(void);
 static void view_purchase_orders_dialog(void);
+static void vendor_product_linking_dialog(void);
+static void system_configuration_dialog(void);
+static void end_of_day_summary_report_dialog(void);
+static void customer_liability_report_dialog(void);
+static void sales_without_customer_report_dialog(void);
+static void product_master_inventory_report_dialog(void);
+static void email_receipt_quote_stub_dialog(void);
+static void recompute_committed_for_store(Store *s, int store_idx);
+static void theme_display_dialog(void);
+static void apply_visual_theme(ThemeMode mode);
+static int should_use_dark_mode(ThemeMode mode);
+static void barcode_label_print_dialog(void);
+static void generate_product_matrix_dialog(void);
+static void service_ai_estimator_dialog(void);
+static void sms_pickup_notification_dialog(void);
+static void sql_query_tools_dialog(void);
 static void add_payment_ledger_entry(int store_idx, const char *transaction_id, const char *payment_method, double amount, const char *note);
 static void summarize_payment_totals_for_store_date(Store *s, const char *from_date, const char *to_date,
                                                     double *cash_total, double *card_total, double *debit_total,
                                                     double *gift_total, double *other_total, int *count_out);
+static void on_add_split_payment_line_clicked(GtkButton *button, gpointer data);
+static double sum_split_payment_rows(GtkTreeModel *model);
+static PaymentType payment_type_from_method_text(const char *text);
+static int days_ago_from_date(const char *date_ymd);
 static int request_manager_override(const char *action_name);
 static const char *user_role_name(UserRole role);
 static int role_can_manage(void);
 static int role_can_service(void);
+static int role_can_inventory(void);
+static int role_can_sql_query(void);
 static void on_work_order_update_status_clicked(GtkButton *button, gpointer data);
 static void on_work_order_add_part_clicked(GtkButton *button, gpointer data);
 static const char *work_order_status_name(WorkOrderStatus status);
@@ -635,10 +706,11 @@ static void add_audit_log_entry(const char *user, const char *action, const char
 
 static const char *user_role_name(UserRole role) {
     switch (role) {
-        case ROLE_ADMIN: return "Admin";
-        case ROLE_MANAGER: return "Manager";
-        case ROLE_SALES: return "Sales";
-        case ROLE_MECHANIC: return "Mechanic";
+        case ROLE_ADMIN: return "System Admin";
+        case ROLE_MANAGER: return "Store Manager";
+        case ROLE_SALES: return "Sales Associate";
+        case ROLE_MECHANIC: return "Service Technician";
+        case ROLE_INVENTORY_MANAGER: return "Inventory Manager";
     }
     return "Unknown";
 }
@@ -649,6 +721,14 @@ static int role_can_manage(void) {
 
 static int role_can_service(void) {
     return role_can_manage() || active_user_role == ROLE_MECHANIC;
+}
+
+static int role_can_inventory(void) {
+    return role_can_manage() || active_user_role == ROLE_INVENTORY_MANAGER;
+}
+
+static int role_can_sql_query(void) {
+    return active_user_role == ROLE_ADMIN;
 }
 
 static int request_manager_override(const char *action_name) {
@@ -699,10 +779,11 @@ static void security_permissions_dialog(void) {
     gtk_container_add(GTK_CONTAINER(content_area), vbox);
 
     GtkWidget *role_combo = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Admin");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Manager");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Sales");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Mechanic");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "System Admin");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Store Manager");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Sales Associate");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Service Technician");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Inventory Manager");
     gtk_combo_box_set_active(GTK_COMBO_BOX(role_combo), active_user_role);
     gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Active Role:"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), role_combo, FALSE, FALSE, 0);
@@ -711,7 +792,7 @@ static void security_permissions_dialog(void) {
     gtk_entry_set_text(GTK_ENTRY(pin_entry), manager_override_pin);
     gtk_entry_set_visibility(GTK_ENTRY(pin_entry), FALSE);
 
-    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Use this to restrict sensitive actions (refunds, cancellations, overrides)."), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Role permissions: Sales (basic POS), Service (work orders), Inventory (master data), Manager/Admin (overrides)."), FALSE, FALSE, 0);
 
     gtk_widget_show_all(dialog);
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
@@ -720,6 +801,9 @@ static void security_permissions_dialog(void) {
         if (pin && strlen(pin) > 0) {
             strncpy(manager_override_pin, pin, NAME_LEN - 1);
             manager_override_pin[NAME_LEN - 1] = '\0';
+        }
+        if (active_user_role < ROLE_ADMIN || active_user_role > ROLE_INVENTORY_MANAGER) {
+            active_user_role = ROLE_MANAGER;
         }
         char detail[128];
         snprintf(detail, sizeof(detail), "Role switched to %s", user_role_name(active_user_role));
@@ -900,9 +984,12 @@ static void alert_center_dialog(void) {
     int low_stock_count = 0;
     for (int si = 0; si < store_count; si++) {
         Store *s = &stores[si];
+        recompute_committed_for_store(s, si);
         for (int p = 0; p < s->product_count; p++) {
-            if (s->products[p].stock <= 2) {
-                snprintf(line, sizeof(line), "LOW STOCK | Store:%s | SKU:%s | %s | Stock:%d\n", s->name, s->products[p].sku, s->products[p].name, s->products[p].stock);
+            int available = s->products[p].stock - s->products[p].committed_qty;
+            if (available <= 2) {
+                snprintf(line, sizeof(line), "LOW STOCK | Store:%s | SKU:%s | %s | Available:%d | Stock:%d | Committed:%d\n",
+                         s->name, s->products[p].sku, s->products[p].name, available, s->products[p].stock, s->products[p].committed_qty);
                 strncat(report, line, sizeof(report) - strlen(report) - 1);
                 low_stock_count++;
             }
@@ -978,6 +1065,59 @@ static int str_contains_case_insensitive(const char *haystack, const char *needl
         if (j == n_len) return 1;
     }
     return 0;
+}
+
+static double sum_split_payment_rows(GtkTreeModel *model) {
+    if (!model) return 0.0;
+    double total = 0.0;
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
+    while (valid) {
+        double amount = 0.0;
+        gtk_tree_model_get(model, &iter, 1, &amount, -1);
+        total += amount;
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+    return total;
+}
+
+static PaymentType payment_type_from_method_text(const char *text) {
+    if (!text) return PAYMENT_CASH;
+    if (str_contains_case_insensitive(text, "credit")) return PAYMENT_CREDIT;
+    if (str_contains_case_insensitive(text, "debit")) return PAYMENT_DEBIT;
+    if (str_contains_case_insensitive(text, "gift")) return PAYMENT_GIFT;
+    return PAYMENT_CASH;
+}
+
+static void on_add_split_payment_line_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    GtkWidget *dialog = GTK_WIDGET(data);
+    GtkListStore *store = GTK_LIST_STORE(g_object_get_data(G_OBJECT(dialog), "split_store"));
+    GtkWidget *method_combo = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "split_method_combo"));
+    GtkWidget *amount_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "split_amount_entry"));
+    GtkWidget *total_label = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "split_total_label"));
+    if (!store || !method_combo || !amount_entry || !total_label) return;
+
+    int method_idx = gtk_combo_box_get_active(GTK_COMBO_BOX(method_combo));
+    const char *methods[] = {"Cash", "Credit Card", "Debit Card", "Gift Card", "Financing", "Check", "Trade-In", "On Account"};
+    const char *method = (method_idx >= 0 && method_idx < 8) ? methods[method_idx] : "Cash";
+    double amount = atof(gtk_entry_get_text(GTK_ENTRY(amount_entry)));
+    if (amount <= 0.0) {
+        show_error_dialog("Split amount must be greater than zero.");
+        return;
+    }
+
+    GtkTreeIter iter;
+    gtk_list_store_append(store, &iter);
+    gtk_list_store_set(store, &iter,
+                       0, method,
+                       1, amount,
+                       -1);
+    gtk_entry_set_text(GTK_ENTRY(amount_entry), "");
+
+    char total_text[80];
+    snprintf(total_text, sizeof(total_text), "Split Entered: $%.2f", sum_split_payment_rows(GTK_TREE_MODEL(store)));
+    gtk_label_set_text(GTK_LABEL(total_label), total_text);
 }
 
 static void add_payment_ledger_entry(int store_idx, const char *transaction_id, const char *payment_method, double amount, const char *note) {
@@ -1235,6 +1375,8 @@ static void create_purchase_order_dialog(void) {
             struct tm *tm_info = localtime(&now);
             strftime(po->created_at, sizeof(po->created_at), "%Y-%m-%d %H:%M", tm_info);
 
+            p->on_order_qty += qty;
+
             char detail[200];
             snprintf(detail, sizeof(detail), "PO-%d SKU:%s Qty:%d Vendor:%s", po->id, po->sku, po->qty_ordered, po->vendor);
             add_audit_log_entry("Ascend User", "PurchaseOrderCreate", detail);
@@ -1313,6 +1455,9 @@ static void receive_purchase_order_dialog(void) {
                 for (int i = 0; i < s->product_count; i++) {
                     if (strcmp(s->products[i].sku, po->sku) == 0) {
                         s->products[i].stock += qty_recv;
+                        s->products[i].received_qty += qty_recv;
+                        if (s->products[i].on_order_qty >= qty_recv) s->products[i].on_order_qty -= qty_recv;
+                        else s->products[i].on_order_qty = 0;
                         break;
                     }
                 }
@@ -1396,6 +1541,618 @@ static void view_purchase_orders_dialog(void) {
     gtk_widget_show_all(dialog);
     gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
+}
+
+static int days_ago_from_date(const char *date_ymd) {
+    if (!date_ymd || strlen(date_ymd) < 10) return -1;
+    int y = 0, m = 0, d = 0;
+    if (sscanf(date_ymd, "%d-%d-%d", &y, &m, &d) != 3) return -1;
+    struct tm t = {0};
+    t.tm_year = y - 1900;
+    t.tm_mon = m - 1;
+    t.tm_mday = d;
+    t.tm_isdst = -1;
+    time_t then = mktime(&t);
+    if (then == (time_t)-1) return -1;
+    time_t now = time(NULL);
+    double diff = difftime(now, then);
+    if (diff < 0) return 0;
+    return (int)(diff / 86400.0);
+}
+
+static void recompute_committed_for_store(Store *s, int store_idx) {
+    if (!s) return;
+    for (int i = 0; i < s->product_count; i++) s->products[i].committed_qty = 0;
+
+    for (int i = 0; i < s->sales_count; i++) {
+        Transaction *t = &s->sales[i];
+        if (t->status != 0) continue;
+        for (int k = 0; k < t->item_count; k++) {
+            for (int p = 0; p < s->product_count; p++) {
+                if (strcmp(s->products[p].sku, t->item_sku[k]) == 0) {
+                    s->products[p].committed_qty += t->qty[k] > 0 ? t->qty[k] : 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < reservation_count; i++) {
+        Reservation *r = &reservations[i];
+        if (r->hidden || r->store_idx != store_idx || r->status != 0) continue;
+        for (int p = 0; p < s->product_count; p++) {
+            if (strcmp(s->products[p].sku, r->sku) == 0) {
+                s->products[p].committed_qty += r->qty;
+                break;
+            }
+        }
+    }
+}
+
+static int should_use_dark_mode(ThemeMode mode) {
+    if (mode == THEME_DARK) return 1;
+    if (mode == THEME_LIGHT) return 0;
+    if (active_user_role == ROLE_MECHANIC) return 1;
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    if (!tm_info) return 0;
+    return (tm_info->tm_hour >= 19 || tm_info->tm_hour < 7) ? 1 : 0;
+}
+
+static void apply_visual_theme(ThemeMode mode) {
+    active_theme_mode = mode;
+    if (!app_css_provider) app_css_provider = gtk_css_provider_new();
+
+    const int dark = should_use_dark_mode(mode);
+    const char *css_light =
+        "* { font-family: 'Segoe UI', 'Helvetica Neue', sans-serif; }"
+        "window { background-color: #F4F7F9; color: #1E2A36; }"
+        "menu, menuitem, menubar { background-color: #EAF0F4; color: #1E2A36; }"
+        "button { background: #0056A4; color: #FFFFFF; border-radius: 6px; padding: 4px 8px; }"
+        "entry, textview, treeview { background: #FFFFFF; color: #1E2A36; border: 1px solid #C5D1DC; }"
+        "label { color: #1E2A36; }"
+        ".danger, .balance-due { color: #C62828; font-weight: 700; }";
+
+    const char *css_dark =
+        "* { font-family: 'Segoe UI', 'Helvetica Neue', sans-serif; }"
+        "window { background-color: #121212; color: #E6EEF8; }"
+        "menu, menuitem, menubar { background-color: #1E1E2E; color: #E6EEF8; }"
+        "button { background: #4A90E2; color: #FFFFFF; border-radius: 6px; padding: 4px 8px; }"
+        "entry, textview, treeview { background: #2D2D3D; color: #E6EEF8; border: 1px solid #4A5568; }"
+        "label { color: #E6EEF8; }"
+        ".danger, .balance-due { color: #FF6B6B; text-shadow: 0 0 6px rgba(255,80,80,0.55); font-weight: 700; }";
+
+    gtk_css_provider_load_from_data(app_css_provider, dark ? css_dark : css_light, -1, NULL);
+    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
+                                              GTK_STYLE_PROVIDER(app_css_provider),
+                                              GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    if (main_window) {
+        if (mobile_floor_mode_enabled) gtk_window_set_default_size(GTK_WINDOW(main_window), 900, 650);
+        else gtk_window_set_default_size(GTK_WINDOW(main_window), 500, 400);
+        gtk_widget_queue_draw(main_window);
+    }
+}
+
+static void theme_display_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Theme and Display Mode",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Apply", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+
+    GtkWidget *theme_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(theme_combo), "Light");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(theme_combo), "Dark");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(theme_combo), "Smart (Auto by role/time)");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(theme_combo), active_theme_mode);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Theme:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), theme_combo, FALSE, FALSE, 0);
+
+    GtkWidget *mobile_check = gtk_check_button_new_with_label("Enable Mobile Floor Mode (tablet layout)");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(mobile_check), mobile_floor_mode_enabled);
+    gtk_box_pack_start(GTK_BOX(vbox), mobile_check, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Light mode uses #F4F7F9 and #0056A4. Dark mode uses #121212/#1E1E2E and #4A90E2."), FALSE, FALSE, 0);
+
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        ThemeMode chosen = (ThemeMode)gtk_combo_box_get_active(GTK_COMBO_BOX(theme_combo));
+        if (chosen < THEME_LIGHT || chosen > THEME_SMART) chosen = THEME_SMART;
+        mobile_floor_mode_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(mobile_check));
+        apply_visual_theme(chosen);
+        save_data();
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void barcode_label_print_dialog(void) {
+    if (!role_can_inventory() && !request_manager_override("Print Barcode Labels")) return;
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Print Barcode Labels",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Generate", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    GtkWidget *sku_entry = create_labeled_entry("SKU:", vbox);
+    GtkWidget *qty_entry = create_labeled_entry("Label Count:", vbox);
+    gtk_entry_set_text(GTK_ENTRY(qty_entry), "1");
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char *sku = gtk_entry_get_text(GTK_ENTRY(sku_entry));
+        int count = atoi(gtk_entry_get_text(GTK_ENTRY(qty_entry)));
+        if (count <= 0) count = 1;
+        Product *p = NULL;
+        for (int i = 0; i < s->product_count; i++) {
+            if (strcmp(s->products[i].sku, sku) == 0) { p = &s->products[i]; break; }
+        }
+        if (!p) {
+            show_error_dialog("SKU not found.");
+        } else {
+            FILE *f = fopen("barcode_labels.csv", "w");
+            if (!f) {
+                show_error_dialog("Unable to write barcode_labels.csv");
+            } else {
+                fprintf(f, "LabelIndex,SKU,UPC,Name\n");
+                for (int i = 0; i < count; i++) {
+                    fprintf(f, "%d,%s,%s,%s\n", i + 1, p->sku, p->upc, p->name);
+                }
+                fclose(f);
+                show_info_dialog("Label file created: barcode_labels.csv");
+            }
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void generate_product_matrix_dialog(void) {
+    if (!role_can_inventory() && !request_manager_override("Generate Product Matrix")) return;
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Generate Product Matrix",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Generate", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    GtkWidget *base_name = create_labeled_entry("Base Name:", vbox);
+    GtkWidget *base_sku = create_labeled_entry("Base SKU Prefix:", vbox);
+    GtkWidget *colors = create_labeled_entry("Colors (comma-separated):", vbox);
+    GtkWidget *sizes = create_labeled_entry("Sizes (comma-separated):", vbox);
+    GtkWidget *price_entry = create_labeled_entry("Sale Price:", vbox);
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        char color_buf[NAME_LEN * 8], size_buf[NAME_LEN * 8];
+        strncpy(color_buf, gtk_entry_get_text(GTK_ENTRY(colors)), sizeof(color_buf) - 1);
+        color_buf[sizeof(color_buf) - 1] = '\0';
+        strncpy(size_buf, gtk_entry_get_text(GTK_ENTRY(sizes)), sizeof(size_buf) - 1);
+        size_buf[sizeof(size_buf) - 1] = '\0';
+        const char *name = gtk_entry_get_text(GTK_ENTRY(base_name));
+        const char *sku_prefix = gtk_entry_get_text(GTK_ENTRY(base_sku));
+        double price = atof(gtk_entry_get_text(GTK_ENTRY(price_entry)));
+
+        int created = 0;
+        char *color_tok = strtok(color_buf, ",");
+        while (color_tok) {
+            while (*color_tok == ' ') color_tok++;
+            char size_copy[NAME_LEN * 8];
+            strncpy(size_copy, size_buf, sizeof(size_copy) - 1);
+            size_copy[sizeof(size_copy) - 1] = '\0';
+            char *size_tok = strtok(size_copy, ",");
+            while (size_tok) {
+                while (*size_tok == ' ') size_tok++;
+                if (s->product_count >= MAX_PRODUCTS) break;
+                Product *p = &s->products[s->product_count++];
+                memset(p, 0, sizeof(Product));
+                snprintf(p->name, sizeof(p->name), "%s %s %s", name, color_tok, size_tok);
+                snprintf(p->sku, sizeof(p->sku), "%s-%s-%s", sku_prefix, color_tok, size_tok);
+                strncpy(p->color, color_tok, NAME_LEN - 1);
+                strncpy(p->size, size_tok, NAME_LEN - 1);
+                p->price = price;
+                p->msrp = price;
+                created++;
+                size_tok = strtok(NULL, ",");
+            }
+            if (s->product_count >= MAX_PRODUCTS) break;
+            color_tok = strtok(NULL, ",");
+        }
+        if (created > 0) {
+            save_data();
+            char msg[120];
+            snprintf(msg, sizeof(msg), "Created %d product variants.", created);
+            show_info_dialog(msg);
+        } else {
+            show_error_dialog("No variants generated.");
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void service_ai_estimator_dialog(void) {
+    if (!role_can_service() && !request_manager_override("AI Service Estimator")) return;
+    double backlog_hours = 0.0;
+    int open_count = 0;
+    for (int i = 0; i < work_order_count; i++) {
+        WorkOrder *wo = &work_orders[i];
+        if (wo->hidden) continue;
+        if (wo->status == WO_PICKED_UP || wo->status == WO_COMPLETED) continue;
+        backlog_hours += wo->labor_hours;
+        open_count++;
+    }
+    double hours_per_day = 7.5;
+    double days = backlog_hours / hours_per_day;
+    time_t now = time(NULL);
+    now += (time_t)(days * 86400.0);
+    struct tm *eta_tm = localtime(&now);
+    char eta[64] = "unknown";
+    if (eta_tm) strftime(eta, sizeof(eta), "%Y-%m-%d", eta_tm);
+    char msg[320];
+    snprintf(msg, sizeof(msg),
+             "AI Service Estimator (rule-based)\n\nOpen Work Orders: %d\nEstimated Backlog Hours: %.1f\nSuggested Ready Date: %s\n\nUse this as a customer-facing estimate and adjust for parts delays.",
+             open_count, backlog_hours, eta);
+    show_info_dialog(msg);
+}
+
+static void sms_pickup_notification_dialog(void) {
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("SMS Pickup Notification",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Queue SMS", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    GtkWidget *cust_name = create_labeled_entry("Customer Name:", vbox);
+    GtkWidget *phone = create_labeled_entry("Phone:", vbox);
+    GtkWidget *msg = create_labeled_entry("Message:", vbox);
+    gtk_entry_set_text(GTK_ENTRY(msg), "Your bike is ready for pickup.");
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        char details[260];
+        snprintf(details, sizeof(details), "Store:%s To:%s (%s) Msg:%s",
+                 s->name,
+                 gtk_entry_get_text(GTK_ENTRY(cust_name)),
+                 gtk_entry_get_text(GTK_ENTRY(phone)),
+                 gtk_entry_get_text(GTK_ENTRY(msg)));
+        add_audit_log_entry(current_sales_user, "SMSQueue", details);
+        show_info_dialog("SMS queued (stub integration). Connect Twilio or provider API for delivery.");
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void sql_query_tools_dialog(void) {
+    if (!role_can_sql_query()) {
+        show_error_dialog("SQL/Cust/Prod query tools are restricted to System Admin.");
+        return;
+    }
+    show_info_dialog("SQL Query, Cust. Query, and Prod. Query tools are enabled for System Admin.\nHook this dialog to a secure query engine with parameterized execution.");
+}
+
+static void system_configuration_dialog(void) {
+    if (!role_can_manage() && !request_manager_override("System Configuration")) return;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("System Configuration",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Save", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+
+    GtkWidget *sales_user_entry = create_labeled_entry("Current Sales User:", vbox);
+    gtk_entry_set_text(GTK_ENTRY(sales_user_entry), current_sales_user);
+    GtkWidget *popup_entry = create_labeled_entry("Custom Sales Message:", vbox);
+    gtk_entry_set_text(GTK_ENTRY(popup_entry), system_sales_popup_message);
+    GtkWidget *sync_check = gtk_check_button_new_with_label("Enable Multi-Store Sync");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sync_check), enable_multistore_sync);
+    gtk_box_pack_start(GTK_BOX(vbox), sync_check, FALSE, FALSE, 0);
+    GtkWidget *trek_auto_check = gtk_check_button_new_with_label("Enable Trek Auto Registration Prompt");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(trek_auto_check), trek_auto_register);
+    gtk_box_pack_start(GTK_BOX(vbox), trek_auto_check, FALSE, FALSE, 0);
+    GtkWidget *default_tax_entry = create_labeled_entry("Default Tax Rate (e.g. 0.0825):", vbox);
+    {
+        char tmp[32];
+        snprintf(tmp, sizeof(tmp), "%.4f", app_settings.default_tax_rate);
+        gtk_entry_set_text(GTK_ENTRY(default_tax_entry), tmp);
+    }
+    GtkWidget *max_sales_discount_entry = create_labeled_entry("Max Sales Discount %:", vbox);
+    {
+        char tmp[32];
+        snprintf(tmp, sizeof(tmp), "%.2f", app_settings.max_discount_percent_sales);
+        gtk_entry_set_text(GTK_ENTRY(max_sales_discount_entry), tmp);
+    }
+
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        strncpy(current_sales_user, gtk_entry_get_text(GTK_ENTRY(sales_user_entry)), NAME_LEN - 1);
+        current_sales_user[NAME_LEN - 1] = '\0';
+        strncpy(system_sales_popup_message, gtk_entry_get_text(GTK_ENTRY(popup_entry)), sizeof(system_sales_popup_message) - 1);
+        system_sales_popup_message[sizeof(system_sales_popup_message) - 1] = '\0';
+        enable_multistore_sync = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(sync_check));
+        trek_auto_register = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(trek_auto_check));
+        app_settings.default_tax_rate = atof(gtk_entry_get_text(GTK_ENTRY(default_tax_entry)));
+        if (app_settings.default_tax_rate < 0.0) app_settings.default_tax_rate = 0.0;
+        app_settings.max_discount_percent_sales = atof(gtk_entry_get_text(GTK_ENTRY(max_sales_discount_entry)));
+        if (app_settings.max_discount_percent_sales < 0.0) app_settings.max_discount_percent_sales = 0.0;
+        add_audit_log_entry(current_sales_user, "SystemConfigUpdate", "Updated sales message/user and sync integration settings");
+        save_data();
+        show_info_dialog("System configuration updated.");
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void vendor_product_linking_dialog(void) {
+    if (!role_can_manage() && !request_manager_override("Vendor Product Linking")) return;
+    int si = choose_store_index();
+    if (si < 0) return;
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Vendor Product Linking",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Add Mapping", 1,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_size_request(sw, 960, 360);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
+    GtkListStore *list = gtk_list_store_new(4, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    for (int i = 0; i < vendor_link_count; i++) {
+        VendorProductLink *v = &vendor_links[i];
+        if (v->hidden || v->store_idx != si) continue;
+        GtkTreeIter iter;
+        gtk_list_store_append(list, &iter);
+        gtk_list_store_set(list, &iter,
+                           0, v->in_store_sku,
+                           1, v->vendor_name,
+                           2, v->vendor_product_code,
+                           3, v->vendor_description,
+                           -1);
+    }
+    GtkWidget *tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(list));
+    GtkCellRenderer *rend = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "In-Store SKU", rend, "text", 0, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Vendor", rend, "text", 1, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Vendor Product", rend, "text", 2, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Vendor Description", rend, "text", 3, NULL);
+    gtk_container_add(GTK_CONTAINER(sw), tree);
+
+    gtk_widget_show_all(dialog);
+    while (1) {
+        int response = gtk_dialog_run(GTK_DIALOG(dialog));
+        if (response != 1) break;
+        if (vendor_link_count >= MAX_VENDOR_LINKS) {
+            show_error_dialog("Maximum vendor links reached.");
+            continue;
+        }
+
+        GtkWidget *add_dialog = gtk_dialog_new_with_buttons("Add Vendor Product Link",
+                                                            GTK_WINDOW(dialog),
+                                                            GTK_DIALOG_MODAL,
+                                                            "_Save", GTK_RESPONSE_OK,
+                                                            "_Cancel", GTK_RESPONSE_CANCEL,
+                                                            NULL);
+        GtkWidget *add_area = gtk_dialog_get_content_area(GTK_DIALOG(add_dialog));
+        GtkWidget *add_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+        gtk_container_set_border_width(GTK_CONTAINER(add_box), 10);
+        gtk_container_add(GTK_CONTAINER(add_area), add_box);
+        GtkWidget *sku_entry = create_labeled_entry("In-Store SKU:", add_box);
+        GtkWidget *vendor_entry = create_labeled_entry("Vendor Name:", add_box);
+        GtkWidget *vendor_code_entry = create_labeled_entry("Vendor Product Code:", add_box);
+        GtkWidget *desc_entry = create_labeled_entry("Vendor Description:", add_box);
+        gtk_widget_show_all(add_dialog);
+        if (gtk_dialog_run(GTK_DIALOG(add_dialog)) == GTK_RESPONSE_OK) {
+            const char *sku = gtk_entry_get_text(GTK_ENTRY(sku_entry));
+            const char *vendor = gtk_entry_get_text(GTK_ENTRY(vendor_entry));
+            const char *code = gtk_entry_get_text(GTK_ENTRY(vendor_code_entry));
+            const char *desc = gtk_entry_get_text(GTK_ENTRY(desc_entry));
+            if (strlen(sku) == 0 || strlen(vendor) == 0 || strlen(code) == 0) {
+                show_error_dialog("SKU, Vendor, and Vendor Product Code are required.");
+            } else {
+                VendorProductLink *v = &vendor_links[vendor_link_count++];
+                memset(v, 0, sizeof(VendorProductLink));
+                v->store_idx = si;
+                strncpy(v->in_store_sku, sku, NAME_LEN - 1);
+                strncpy(v->vendor_name, vendor, NAME_LEN - 1);
+                strncpy(v->vendor_product_code, code, NAME_LEN - 1);
+                strncpy(v->vendor_description, desc, sizeof(v->vendor_description) - 1);
+
+                GtkTreeIter iter;
+                gtk_list_store_append(list, &iter);
+                gtk_list_store_set(list, &iter,
+                                   0, v->in_store_sku,
+                                   1, v->vendor_name,
+                                   2, v->vendor_product_code,
+                                   3, v->vendor_description,
+                                   -1);
+                add_audit_log_entry(current_sales_user, "VendorLinkCreate", v->vendor_product_code);
+                save_data();
+            }
+        }
+        gtk_widget_destroy(add_dialog);
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void email_receipt_quote_stub_dialog(void) {
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Email Receipt / Quote",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Send", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    GtkWidget *txn_entry = create_labeled_entry("Transaction/Quote ID:", vbox);
+    GtkWidget *email_entry = create_labeled_entry("Email To:", vbox);
+    GtkWidget *type_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(type_combo), "Receipt");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(type_combo), "Quote");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(type_combo), 0);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Document Type:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), type_combo, FALSE, FALSE, 0);
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char *id = gtk_entry_get_text(GTK_ENTRY(txn_entry));
+        const char *email = gtk_entry_get_text(GTK_ENTRY(email_entry));
+        const char *dtype = gtk_combo_box_get_active(GTK_COMBO_BOX(type_combo)) == 1 ? "Quote" : "Receipt";
+        if (strlen(id) == 0 || strlen(email) == 0) {
+            show_error_dialog("ID and recipient email are required.");
+        } else {
+            char details[220];
+            snprintf(details, sizeof(details), "%s:%s Store:%s To:%s", dtype, id, s->name, email);
+            add_audit_log_entry(current_sales_user, "EmailDocument", details);
+            show_info_dialog("Email queued (stub integration).\nConnect SMTP/API provider to send for real.");
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void end_of_day_summary_report_dialog(void) {
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+    char today[NAME_LEN];
+    get_today_date(today, sizeof(today));
+
+    int txn_count = 0;
+    int open_count = 0;
+    int return_count = 0;
+    double gross = 0.0;
+    for (int i = 0; i < s->sales_count; i++) {
+        Transaction *t = &s->sales[i];
+        if (strlen(t->date) < 10) continue;
+        if (strncmp(t->date, today, 10) != 0) continue;
+        txn_count++;
+        gross += t->total;
+        if (t->status == 0) open_count++;
+        if (t->is_return) return_count++;
+    }
+    double cash = 0.0, card = 0.0, debit = 0.0, gift = 0.0, other = 0.0;
+    int ledger_count = 0;
+    summarize_payment_totals_for_store_date(s, today, today, &cash, &card, &debit, &gift, &other, &ledger_count);
+
+    char report[3000];
+    snprintf(report, sizeof(report),
+             "END OF DAY SUMMARY\n\n"
+             "Store: %s\n"
+             "Date: %s\n\n"
+             "Transactions: %d\n"
+             "Open Transactions: %d\n"
+             "Returns: %d\n"
+             "Gross Sales: $%.2f\n\n"
+             "Payments (Ledger Entries): %d\n"
+             "Cash: $%.2f\n"
+             "Credit: $%.2f\n"
+             "Debit: $%.2f\n"
+             "Gift/In-Store Credit: $%.2f\n"
+             "Other: $%.2f\n",
+             s->name, today, txn_count, open_count, return_count, gross,
+             ledger_count, cash, card, debit, gift, other);
+    show_info_dialog(report);
+}
+
+static void customer_liability_report_dialog(void) {
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+    char report[12000] = "CUSTOMER LIABILITY REPORT\n\n";
+    double total_liability = 0.0;
+    for (int i = 0; i < s->sales_count; i++) {
+        Transaction *t = &s->sales[i];
+        if (t->customer_idx < 0 || t->customer_idx >= s->customer_count) continue;
+        if (t->status != 0) continue;
+        double due = t->total - t->amount_paid;
+        if (due <= 0.0) continue;
+        Customer *c = &s->customers[t->customer_idx];
+        char line[260];
+        snprintf(line, sizeof(line), "%s | %s %s | Due:$%.2f\n", t->transaction_id, c->first_name, c->last_name, due);
+        strncat(report, line, sizeof(report) - strlen(report) - 1);
+        total_liability += due;
+    }
+    char summary[120];
+    snprintf(summary, sizeof(summary), "\nTotal Liability: $%.2f", total_liability);
+    strncat(report, summary, sizeof(report) - strlen(report) - 1);
+    show_info_dialog(report);
+}
+
+static void sales_without_customer_report_dialog(void) {
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+    char report[12000] = "SALES WITHOUT ASSIGNED CUSTOMER\n\n";
+    int count = 0;
+    for (int i = 0; i < s->sales_count; i++) {
+        Transaction *t = &s->sales[i];
+        if (t->customer_idx >= 0) continue;
+        char line[220];
+        snprintf(line, sizeof(line), "%s | Date:%s | Total:$%.2f | Status:%d\n", t->transaction_id, t->date, t->total, t->status);
+        strncat(report, line, sizeof(report) - strlen(report) - 1);
+        count++;
+    }
+    if (count == 0) strncat(report, "No unassigned sales found.\n", sizeof(report) - strlen(report) - 1);
+    show_info_dialog(report);
+}
+
+static void product_master_inventory_report_dialog(void) {
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+    recompute_committed_for_store(s, si);
+    char report[12000] = "PRODUCT MASTER + INVENTORY\n\n";
+    for (int i = 0; i < s->product_count; i++) {
+        Product *p = &s->products[i];
+        double margin = (p->price > 0.0) ? ((p->price - p->average_cost) / p->price) * 100.0 : 0.0;
+        char line[420];
+        snprintf(line, sizeof(line),
+                 "%s | %s | Brand:%s | UPC:%s | MPN:%s | Year:%d | Color:%s | Size:%s\n"
+                 "  MSRP:$%.2f Sale:$%.2f Avg:$%.2f Last:$%.2f Margin:%.1f%% | Stock:%d OnOrder:%d Received:%d Committed:%d | eCom:%s\n",
+                 p->sku, p->name,
+                 p->brand, p->upc, p->manufacturer_part_number, p->model_year, p->color, p->size,
+                 p->msrp, p->price, p->average_cost, p->last_cost, margin,
+                 p->stock, p->on_order_qty, p->received_qty, p->committed_qty,
+                 p->ecommerce_sync ? "Yes" : "No");
+        strncat(report, line, sizeof(report) - strlen(report) - 1);
+    }
+    show_info_dialog(report);
 }
 
 static int selected_work_order_row_index(GtkWidget *dialog, GtkTreeIter *out_iter) {
@@ -2203,6 +2960,18 @@ static void show_main_menu(void) {
     g_signal_connect(receive_po_item, "activate", G_CALLBACK(receive_purchase_order_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), receive_po_item);
 
+    GtkWidget *vendor_link_item = gtk_menu_item_new_with_label("Vendor Product Linking");
+    g_signal_connect(vendor_link_item, "activate", G_CALLBACK(vendor_product_linking_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), vendor_link_item);
+
+    GtkWidget *system_config_item = gtk_menu_item_new_with_label("System Configuration");
+    g_signal_connect(system_config_item, "activate", G_CALLBACK(system_configuration_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), system_config_item);
+
+    GtkWidget *email_doc_item = gtk_menu_item_new_with_label("Email Receipt / Quote");
+    g_signal_connect(email_doc_item, "activate", G_CALLBACK(email_receipt_quote_stub_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), email_doc_item);
+
     GtkWidget *audit_log_item = gtk_menu_item_new_with_label("Audit Log");
     g_signal_connect(audit_log_item, "activate", G_CALLBACK(audit_log_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), audit_log_item);
@@ -2214,6 +2983,22 @@ static void show_main_menu(void) {
     GtkWidget *security_item = gtk_menu_item_new_with_label("Security and Permissions");
     g_signal_connect(security_item, "activate", G_CALLBACK(security_permissions_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), security_item);
+
+    GtkWidget *theme_item = gtk_menu_item_new_with_label("Theme and Display Mode");
+    g_signal_connect(theme_item, "activate", G_CALLBACK(theme_display_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), theme_item);
+
+    GtkWidget *barcode_item = gtk_menu_item_new_with_label("Print Barcode Labels");
+    g_signal_connect(barcode_item, "activate", G_CALLBACK(barcode_label_print_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), barcode_item);
+
+    GtkWidget *matrix_item = gtk_menu_item_new_with_label("Generate Product Matrix");
+    g_signal_connect(matrix_item, "activate", G_CALLBACK(generate_product_matrix_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), matrix_item);
+
+    GtkWidget *sql_tools_item = gtk_menu_item_new_with_label("SQL / Customer / Product Query Tools");
+    g_signal_connect(sql_tools_item, "activate", G_CALLBACK(sql_query_tools_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), sql_tools_item);
 
     // Reports menu
     GtkWidget *reports_menu = gtk_menu_new();
@@ -2249,6 +3034,22 @@ static void show_main_menu(void) {
     g_signal_connect(payment_ledger_report_item, "activate", G_CALLBACK(payment_ledger_report_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), payment_ledger_report_item);
 
+    GtkWidget *eod_report_item = gtk_menu_item_new_with_label("End of Day Summary");
+    g_signal_connect(eod_report_item, "activate", G_CALLBACK(end_of_day_summary_report_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), eod_report_item);
+
+    GtkWidget *liability_report_item = gtk_menu_item_new_with_label("Customer Liability Details");
+    g_signal_connect(liability_report_item, "activate", G_CALLBACK(customer_liability_report_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), liability_report_item);
+
+    GtkWidget *no_customer_sales_item = gtk_menu_item_new_with_label("Sales Without Assigned Customers");
+    g_signal_connect(no_customer_sales_item, "activate", G_CALLBACK(sales_without_customer_report_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), no_customer_sales_item);
+
+    GtkWidget *product_master_item = gtk_menu_item_new_with_label("Product Master + Inventory");
+    g_signal_connect(product_master_item, "activate", G_CALLBACK(product_master_inventory_report_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), product_master_item);
+
     GtkWidget *low_stock_item = gtk_menu_item_new_with_label("Low Stock");
     g_signal_connect(low_stock_item, "activate", G_CALLBACK(low_stock_report_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), low_stock_item);
@@ -2256,6 +3057,14 @@ static void show_main_menu(void) {
     GtkWidget *best_sellers_item = gtk_menu_item_new_with_label("Best-Selling Items");
     g_signal_connect(best_sellers_item, "activate", G_CALLBACK(best_selling_items_report_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), best_sellers_item);
+
+    GtkWidget *ai_estimator_item = gtk_menu_item_new_with_label("AI Service Estimator");
+    g_signal_connect(ai_estimator_item, "activate", G_CALLBACK(service_ai_estimator_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), ai_estimator_item);
+
+    GtkWidget *sms_pickup_item = gtk_menu_item_new_with_label("SMS Pickup Notifications");
+    g_signal_connect(sms_pickup_item, "activate", G_CALLBACK(sms_pickup_notification_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), sms_pickup_item);
 
     // Help menu
     GtkWidget *help_menu = gtk_menu_new();
@@ -3286,6 +4095,7 @@ static void low_stock_report_dialog(void) {
     int si = choose_store_index();
     if (si < 0) return;
     Store *s = &stores[si];
+    recompute_committed_for_store(s, si);
 
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Low Stock Report",
                                                    GTK_WINDOW(main_window),
@@ -3332,8 +4142,10 @@ static void low_stock_report_dialog(void) {
             int count = 0;
             for (int i = 0; i < s->product_count; i++) {
                 Product *p = &s->products[i];
-                if (p->stock <= threshold) {
-                    snprintf(line, sizeof(line), "%s | SKU: %s | In Stock: %d | Price: $%.2f\n", p->name, p->sku, p->stock, p->price);
+                int available = p->stock - p->committed_qty;
+                if (available <= threshold) {
+                    snprintf(line, sizeof(line), "%s | SKU: %s | Available: %d | Stock: %d | Committed: %d | Price: $%.2f\n",
+                             p->name, p->sku, available, p->stock, p->committed_qty, p->price);
                     strncat(report, line, sizeof(report) - strlen(report) - 1);
                     count++;
                 }
@@ -3360,6 +4172,7 @@ static void on_export_low_stock_report_clicked(GtkButton *button, gpointer data)
     if (!threshold_entry || si < 0 || si >= store_count) return;
 
     Store *s = &stores[si];
+    recompute_committed_for_store(s, si);
     int threshold = atoi(gtk_entry_get_text(GTK_ENTRY(threshold_entry)));
     if (threshold < 0) threshold = 0;
 
@@ -3369,11 +4182,12 @@ static void on_export_low_stock_report_clicked(GtkButton *button, gpointer data)
         return;
     }
 
-    fprintf(f, "Name,SKU,In Stock,Price\n");
+    fprintf(f, "Name,SKU,Available,In Stock,Committed,Price\n");
     for (int i = 0; i < s->product_count; i++) {
         Product *p = &s->products[i];
-        if (p->stock <= threshold) {
-            fprintf(f, "%s,%s,%d,%.2f\n", p->name, p->sku, p->stock, p->price);
+        int available = p->stock - p->committed_qty;
+        if (available <= threshold) {
+            fprintf(f, "%s,%s,%d,%d,%d,%.2f\n", p->name, p->sku, available, p->stock, p->committed_qty, p->price);
         }
     }
     fclose(f);
@@ -3542,11 +4356,11 @@ static void store_info_dialog(void) {
     strcat(info, "\nProducts: \n");
     for (int i = 0; i < s->product_count; i++) {
         Product *p = &s->products[i];
-        char line[200];
-        sprintf(line, "- %s (%s) %s %s $%.2f stock=%d\n", p->name, p->sku,
+        char line[320];
+        sprintf(line, "- %s (%s) %s %s $%.2f stock=%d onOrder=%d committed=%d\n", p->name, p->sku,
                 p->vendor[0] ? p->vendor : "Unknown",
                 p->serialized ? "[Serialized]" : "[Non-Serialized]",
-                p->price, p->stock);
+            p->price, p->stock, p->on_order_qty, p->committed_qty);
         strcat(info, line);
     }
 
@@ -3568,10 +4382,36 @@ static void add_product_dialog(Store *s) {
     GtkWidget *entry_sku = create_labeled_entry("SKU:", vbox);
     GtkWidget *entry_name = create_labeled_entry("Name:", vbox);
     GtkWidget *entry_vendor = create_labeled_entry("Vendor:", vbox);
+    GtkWidget *entry_brand = create_labeled_entry("Brand:", vbox);
+    GtkWidget *entry_upc = create_labeled_entry("UPC:", vbox);
+    GtkWidget *entry_mpn = create_labeled_entry("Manufacturer Part #:", vbox);
+    GtkWidget *entry_style_name = create_labeled_entry("Style Name:", vbox);
+    GtkWidget *entry_style_number = create_labeled_entry("Style Number:", vbox);
+    GtkWidget *entry_year = create_labeled_entry("Year:", vbox);
+    GtkWidget *entry_color = create_labeled_entry("Color:", vbox);
+    GtkWidget *entry_size = create_labeled_entry("Size:", vbox);
+    GtkWidget *entry_msrp = create_labeled_entry("MSRP ($):", vbox);
+    GtkWidget *entry_avg_cost = create_labeled_entry("Average Cost ($):", vbox);
+    GtkWidget *entry_last_cost = create_labeled_entry("Last Cost ($):", vbox);
     GtkWidget *entry_price = create_labeled_entry("Price ($):", vbox);
     GtkWidget *entry_stock = create_labeled_entry("Stock:", vbox);
+    GtkWidget *entry_min_on = create_labeled_entry("Min On-Season:", vbox);
+    GtkWidget *entry_max_on = create_labeled_entry("Max On-Season:", vbox);
+    GtkWidget *entry_min_off = create_labeled_entry("Min Off-Season:", vbox);
+    GtkWidget *entry_max_off = create_labeled_entry("Max Off-Season:", vbox);
     GtkWidget *serialized_check = gtk_check_button_new_with_label("Serialized (Trek-bike style)");
+    GtkWidget *ecom_check = gtk_check_button_new_with_label("Sync to eCommerce");
     gtk_box_pack_start(GTK_BOX(vbox), serialized_check, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), ecom_check, FALSE, FALSE, 0);
+
+    gtk_entry_set_text(GTK_ENTRY(entry_year), "2026");
+    gtk_entry_set_text(GTK_ENTRY(entry_msrp), "0.00");
+    gtk_entry_set_text(GTK_ENTRY(entry_avg_cost), "0.00");
+    gtk_entry_set_text(GTK_ENTRY(entry_last_cost), "0.00");
+    gtk_entry_set_text(GTK_ENTRY(entry_min_on), "2");
+    gtk_entry_set_text(GTK_ENTRY(entry_max_on), "8");
+    gtk_entry_set_text(GTK_ENTRY(entry_min_off), "1");
+    gtk_entry_set_text(GTK_ENTRY(entry_max_off), "4");
 
     gtk_widget_show_all(dialog);
 
@@ -3579,8 +4419,23 @@ static void add_product_dialog(Store *s) {
         const char *sku = gtk_entry_get_text(GTK_ENTRY(entry_sku));
         const char *name = gtk_entry_get_text(GTK_ENTRY(entry_name));
         const char *vendor = gtk_entry_get_text(GTK_ENTRY(entry_vendor));
+        const char *brand = gtk_entry_get_text(GTK_ENTRY(entry_brand));
+        const char *upc = gtk_entry_get_text(GTK_ENTRY(entry_upc));
+        const char *mpn = gtk_entry_get_text(GTK_ENTRY(entry_mpn));
+        const char *style_name = gtk_entry_get_text(GTK_ENTRY(entry_style_name));
+        const char *style_number = gtk_entry_get_text(GTK_ENTRY(entry_style_number));
+        const char *year_str = gtk_entry_get_text(GTK_ENTRY(entry_year));
+        const char *color = gtk_entry_get_text(GTK_ENTRY(entry_color));
+        const char *size = gtk_entry_get_text(GTK_ENTRY(entry_size));
+        const char *msrp_str = gtk_entry_get_text(GTK_ENTRY(entry_msrp));
+        const char *avg_cost_str = gtk_entry_get_text(GTK_ENTRY(entry_avg_cost));
+        const char *last_cost_str = gtk_entry_get_text(GTK_ENTRY(entry_last_cost));
         const char *price_str = gtk_entry_get_text(GTK_ENTRY(entry_price));
         const char *stock_str = gtk_entry_get_text(GTK_ENTRY(entry_stock));
+        const char *min_on_str = gtk_entry_get_text(GTK_ENTRY(entry_min_on));
+        const char *max_on_str = gtk_entry_get_text(GTK_ENTRY(entry_max_on));
+        const char *min_off_str = gtk_entry_get_text(GTK_ENTRY(entry_min_off));
+        const char *max_off_str = gtk_entry_get_text(GTK_ENTRY(entry_max_off));
 
         if (strlen(sku) == 0 || strlen(name) == 0) {
             show_error_dialog("SKU and Name are required.");
@@ -3589,9 +4444,28 @@ static void add_product_dialog(Store *s) {
             strncpy(p->sku, sku, NAME_LEN - 1);
             strncpy(p->name, name, NAME_LEN - 1);
             strncpy(p->vendor, vendor[0] ? vendor : "Unknown", NAME_LEN - 1);
+            strncpy(p->brand, brand, NAME_LEN - 1);
+            strncpy(p->upc, upc, NAME_LEN - 1);
+            strncpy(p->manufacturer_part_number, mpn, NAME_LEN - 1);
+            strncpy(p->style_name, style_name, NAME_LEN - 1);
+            strncpy(p->style_number, style_number, NAME_LEN - 1);
+            p->model_year = atoi(year_str);
+            strncpy(p->color, color, NAME_LEN - 1);
+            strncpy(p->size, size, NAME_LEN - 1);
             p->serialized = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(serialized_check));
+            p->msrp = atof(msrp_str);
             p->price = atof(price_str);
+            p->average_cost = atof(avg_cost_str);
+            p->last_cost = atof(last_cost_str);
+            p->ecommerce_sync = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ecom_check));
             p->stock = atoi(stock_str);
+            p->on_order_qty = 0;
+            p->received_qty = 0;
+            p->committed_qty = 0;
+            p->min_on_season = atoi(min_on_str);
+            p->max_on_season = atoi(max_on_str);
+            p->min_off_season = atoi(min_off_str);
+            p->max_off_season = atoi(max_off_str);
             p->sold = 0;
             s->product_count++;
 
@@ -4166,6 +5040,55 @@ static void save_data(void) {
         fprintf(f, "%s\n%s\n%s\n%s\n%s\n%s\n", po->sku, po->vendor, po->expected_date, po->received_date, po->created_at, po->comments);
     }
 
+    fprintf(f, "PRODUCT_MASTER_EXT\n");
+    for (int si = 0; si < store_count; si++) {
+        Store *s = &stores[si];
+        for (int pi = 0; pi < s->product_count; pi++) {
+            Product *p = &s->products[pi];
+            fprintf(f, "%d %d %d %d %d %d %d %d %d %d %.2f %.2f %.2f\n",
+                    si, pi,
+                    p->model_year,
+                    p->ecommerce_sync,
+                    p->on_order_qty,
+                    p->received_qty,
+                    p->committed_qty,
+                    p->min_on_season,
+                    p->max_on_season,
+                    p->min_off_season,
+                    p->msrp,
+                    p->average_cost,
+                    p->last_cost);
+            fprintf(f, "%s\n%s\n%s\n%s\n%s\n%s\n", p->brand, p->upc, p->manufacturer_part_number, p->style_name, p->style_number, p->color);
+            fprintf(f, "%s\n%d\n", p->size, p->max_off_season);
+        }
+    }
+    fprintf(f, "END_PRODUCT_MASTER_EXT\n");
+
+    fprintf(f, "CUSTOMER_PROFILE_EXT\n");
+    for (int si = 0; si < store_count; si++) {
+        Store *s = &stores[si];
+        for (int ci = 0; ci < s->customer_count; ci++) {
+            Customer *c = &s->customers[ci];
+            fprintf(f, "%d %d\n", si, ci);
+            fprintf(f, "%s\n%s\n%s\n%s\n%s\n", c->gender, c->birthdate, c->customer_since, c->last_visit, c->customer_group);
+        }
+    }
+    fprintf(f, "END_CUSTOMER_PROFILE_EXT\n");
+
+    fprintf(f, "VENDOR_LINKS\n%d\n", vendor_link_count);
+    for (int i = 0; i < vendor_link_count; i++) {
+        VendorProductLink *v = &vendor_links[i];
+        fprintf(f, "%d %d\n", v->store_idx, v->hidden);
+        fprintf(f, "%s\n%s\n%s\n%s\n", v->in_store_sku, v->vendor_name, v->vendor_product_code, v->vendor_description);
+    }
+
+        fprintf(f, "SYSTEM_CONFIG\n%d\n%d\n%s\n%s\n", enable_multistore_sync, trek_auto_register, current_sales_user, system_sales_popup_message);
+        fprintf(f, "ADV|%.4f|%.2f|%d|%d\n",
+            app_settings.default_tax_rate,
+            app_settings.max_discount_percent_sales,
+            (int)active_theme_mode,
+            mobile_floor_mode_enabled);
+
     fprintf(f, "SECURITY_SETTINGS\n%d\n%s\n", active_user_role, manager_override_pin);
 
     fclose(f);
@@ -4214,6 +5137,25 @@ static void load_data(void) {
             if (!fgets(pr->vendor, NAME_LEN, f)) break;
             pr->vendor[strcspn(pr->vendor, "\n")] = '\0';
             fscanf(f, "%d %lf %d %d\n", &pr->serialized, &pr->price, &pr->stock, &pr->sold);
+            pr->brand[0] = '\0';
+            pr->upc[0] = '\0';
+            pr->manufacturer_part_number[0] = '\0';
+            pr->style_name[0] = '\0';
+            pr->style_number[0] = '\0';
+            pr->model_year = 0;
+            pr->color[0] = '\0';
+            pr->size[0] = '\0';
+            pr->msrp = pr->price;
+            pr->average_cost = 0.0;
+            pr->last_cost = 0.0;
+            pr->ecommerce_sync = 0;
+            pr->on_order_qty = 0;
+            pr->received_qty = 0;
+            pr->committed_qty = 0;
+            pr->min_on_season = 0;
+            pr->max_on_season = 0;
+            pr->min_off_season = 0;
+            pr->max_off_season = 0;
         }
         for (int d = 0; d < s->day_count; d++) fscanf(f, "%lf\n", &s->daily_sales[d]);
 
@@ -4277,6 +5219,12 @@ static void load_data(void) {
                 fscanf(f, "%d %lf %d %d\n", &cust->poa_status, &cust->credit_limit, &cust->preferred_contact, &cust->hidden);
                 if (!fgets(cust->notes, NAME_LEN * 2, f)) break;
                 cust->notes[strcspn(cust->notes, "\n")] = '\0';
+                cust->gender[0] = '\0';
+                cust->birthdate[0] = '\0';
+                cust->customer_group[0] = '\0';
+                get_today_date(cust->customer_since, sizeof(cust->customer_since));
+                strncpy(cust->last_visit, cust->customer_since, NAME_LEN - 1);
+                cust->last_visit[NAME_LEN - 1] = '\0';
             }
         } else {
             s->customer_count = 0;
@@ -4352,9 +5300,16 @@ static void load_data(void) {
     payment_entry_count = 0;
     purchase_order_count = 0;
     next_purchase_order_id = 8000;
+    vendor_link_count = 0;
     active_user_role = ROLE_MANAGER;
     strncpy(manager_override_pin, "2468", NAME_LEN - 1);
     manager_override_pin[NAME_LEN - 1] = '\0';
+    strncpy(system_sales_popup_message, "Verify info for registration.", sizeof(system_sales_popup_message) - 1);
+    system_sales_popup_message[sizeof(system_sales_popup_message) - 1] = '\0';
+    strncpy(current_sales_user, "Ascend User", NAME_LEN - 1);
+    current_sales_user[NAME_LEN - 1] = '\0';
+    enable_multistore_sync = 1;
+    trek_auto_register = 1;
     app_settings.prompt_work_order_serial = 1;
     app_settings.prompt_receiving_serial = 1;
     app_settings.layaway_reminder_days = 7;
@@ -4694,13 +5649,144 @@ static void load_data(void) {
                     po->comments[sizeof(po->comments) - 1] = '\0';
                 }
             }
+        } else if (strcmp(section_name, "PRODUCT_MASTER_EXT") == 0) {
+            char marker[NAME_LEN];
+            while (fscanf(f, "%63s", marker) == 1) {
+                if (strcmp(marker, "END_PRODUCT_MASTER_EXT") == 0) break;
+                int si = atoi(marker);
+                int pi = 0, model_year = 0, ecom = 0, on_order = 0, received = 0, committed = 0;
+                int min_on = 0, max_on = 0, min_off = 0, max_off = 0;
+                double msrp = 0.0, avg_cost = 0.0, last_cost = 0.0;
+                if (fscanf(f, "%d %d %d %d %d %d %d %d %d %lf %lf %lf\n",
+                           &pi, &model_year, &ecom, &on_order, &received, &committed,
+                           &min_on, &max_on, &min_off, &msrp, &avg_cost, &last_cost) != 12) break;
+                char brand[NAME_LEN], upc[NAME_LEN], mpn[NAME_LEN], style_name[NAME_LEN], style_number[NAME_LEN], color[NAME_LEN], size[NAME_LEN];
+                if (!fgets(brand, sizeof(brand), f)) break;
+                brand[strcspn(brand, "\n")] = '\0';
+                if (!fgets(upc, sizeof(upc), f)) break;
+                upc[strcspn(upc, "\n")] = '\0';
+                if (!fgets(mpn, sizeof(mpn), f)) break;
+                mpn[strcspn(mpn, "\n")] = '\0';
+                if (!fgets(style_name, sizeof(style_name), f)) break;
+                style_name[strcspn(style_name, "\n")] = '\0';
+                if (!fgets(style_number, sizeof(style_number), f)) break;
+                style_number[strcspn(style_number, "\n")] = '\0';
+                if (!fgets(color, sizeof(color), f)) break;
+                color[strcspn(color, "\n")] = '\0';
+                if (!fgets(size, sizeof(size), f)) break;
+                size[strcspn(size, "\n")] = '\0';
+                if (fscanf(f, "%d\n", &max_off) != 1) break;
+                if (si >= 0 && si < store_count && pi >= 0 && pi < stores[si].product_count) {
+                    Product *p = &stores[si].products[pi];
+                    p->model_year = model_year;
+                    p->ecommerce_sync = ecom;
+                    p->on_order_qty = on_order;
+                    p->received_qty = received;
+                    p->committed_qty = committed;
+                    p->min_on_season = min_on;
+                    p->max_on_season = max_on;
+                    p->min_off_season = min_off;
+                    p->max_off_season = max_off;
+                    p->msrp = msrp;
+                    p->average_cost = avg_cost;
+                    p->last_cost = last_cost;
+                    strncpy(p->brand, brand, NAME_LEN - 1);
+                    strncpy(p->upc, upc, NAME_LEN - 1);
+                    strncpy(p->manufacturer_part_number, mpn, NAME_LEN - 1);
+                    strncpy(p->style_name, style_name, NAME_LEN - 1);
+                    strncpy(p->style_number, style_number, NAME_LEN - 1);
+                    strncpy(p->color, color, NAME_LEN - 1);
+                    strncpy(p->size, size, NAME_LEN - 1);
+                }
+            }
+        } else if (strcmp(section_name, "CUSTOMER_PROFILE_EXT") == 0) {
+            char marker[NAME_LEN];
+            while (fscanf(f, "%63s", marker) == 1) {
+                if (strcmp(marker, "END_CUSTOMER_PROFILE_EXT") == 0) break;
+                int si = atoi(marker);
+                int ci = 0;
+                if (fscanf(f, "%d\n", &ci) != 1) break;
+                char gender[NAME_LEN], birthdate[NAME_LEN], since[NAME_LEN], last_visit[NAME_LEN], group[NAME_LEN];
+                if (!fgets(gender, sizeof(gender), f)) break;
+                gender[strcspn(gender, "\n")] = '\0';
+                if (!fgets(birthdate, sizeof(birthdate), f)) break;
+                birthdate[strcspn(birthdate, "\n")] = '\0';
+                if (!fgets(since, sizeof(since), f)) break;
+                since[strcspn(since, "\n")] = '\0';
+                if (!fgets(last_visit, sizeof(last_visit), f)) break;
+                last_visit[strcspn(last_visit, "\n")] = '\0';
+                if (!fgets(group, sizeof(group), f)) break;
+                group[strcspn(group, "\n")] = '\0';
+                if (si >= 0 && si < store_count && ci >= 0 && ci < stores[si].customer_count) {
+                    Customer *c = &stores[si].customers[ci];
+                    strncpy(c->gender, gender, NAME_LEN - 1);
+                    strncpy(c->birthdate, birthdate, NAME_LEN - 1);
+                    strncpy(c->customer_since, since, NAME_LEN - 1);
+                    strncpy(c->last_visit, last_visit, NAME_LEN - 1);
+                    strncpy(c->customer_group, group, NAME_LEN - 1);
+                }
+            }
+        } else if (strcmp(section_name, "VENDOR_LINKS") == 0) {
+            int count = 0;
+            if (fscanf(f, "%d\n", &count) != 1) break;
+            int limit = (count < MAX_VENDOR_LINKS) ? count : MAX_VENDOR_LINKS;
+            vendor_link_count = limit;
+            for (int i = 0; i < count; i++) {
+                int si = 0, hidden = 0;
+                char sku[NAME_LEN], vendor[NAME_LEN], vcode[NAME_LEN], vdesc[NAME_LEN * 2];
+                if (fscanf(f, "%d %d\n", &si, &hidden) != 2) break;
+                if (!fgets(sku, sizeof(sku), f)) break;
+                sku[strcspn(sku, "\n")] = '\0';
+                if (!fgets(vendor, sizeof(vendor), f)) break;
+                vendor[strcspn(vendor, "\n")] = '\0';
+                if (!fgets(vcode, sizeof(vcode), f)) break;
+                vcode[strcspn(vcode, "\n")] = '\0';
+                if (!fgets(vdesc, sizeof(vdesc), f)) break;
+                vdesc[strcspn(vdesc, "\n")] = '\0';
+                if (i < limit) {
+                    VendorProductLink *v = &vendor_links[i];
+                    v->store_idx = si;
+                    v->hidden = hidden;
+                    strncpy(v->in_store_sku, sku, NAME_LEN - 1);
+                    strncpy(v->vendor_name, vendor, NAME_LEN - 1);
+                    strncpy(v->vendor_product_code, vcode, NAME_LEN - 1);
+                    strncpy(v->vendor_description, vdesc, sizeof(v->vendor_description) - 1);
+                }
+            }
+        } else if (strcmp(section_name, "SYSTEM_CONFIG") == 0) {
+            if (fscanf(f, "%d\n%d\n", &enable_multistore_sync, &trek_auto_register) != 2) break;
+            if (!fgets(current_sales_user, sizeof(current_sales_user), f)) break;
+            current_sales_user[strcspn(current_sales_user, "\n")] = '\0';
+            if (!fgets(system_sales_popup_message, sizeof(system_sales_popup_message), f)) break;
+            system_sales_popup_message[strcspn(system_sales_popup_message, "\n")] = '\0';
+            {
+                long pos = ftell(f);
+                char adv_line[256];
+                if (fgets(adv_line, sizeof(adv_line), f)) {
+                    adv_line[strcspn(adv_line, "\n")] = '\0';
+                    if (strncmp(adv_line, "ADV|", 4) == 0) {
+                        double tax = app_settings.default_tax_rate;
+                        double max_disc = app_settings.max_discount_percent_sales;
+                        int theme = (int)active_theme_mode;
+                        int mobile = mobile_floor_mode_enabled;
+                        if (sscanf(adv_line + 4, "%lf|%lf|%d|%d", &tax, &max_disc, &theme, &mobile) >= 2) {
+                            if (tax >= 0.0) app_settings.default_tax_rate = tax;
+                            if (max_disc >= 0.0) app_settings.max_discount_percent_sales = max_disc;
+                            if (theme >= THEME_LIGHT && theme <= THEME_SMART) active_theme_mode = (ThemeMode)theme;
+                            mobile_floor_mode_enabled = mobile ? 1 : 0;
+                        }
+                    } else {
+                        fseek(f, pos, SEEK_SET);
+                    }
+                }
+            }
         } else if (strcmp(section_name, "SECURITY_SETTINGS") == 0) {
             int role_val = ROLE_MANAGER;
             char pin_line[NAME_LEN];
             if (fscanf(f, "%d\n", &role_val) != 1) break;
             if (!fgets(pin_line, sizeof(pin_line), f)) break;
             pin_line[strcspn(pin_line, "\n")] = '\0';
-            if (role_val < ROLE_ADMIN || role_val > ROLE_MECHANIC) role_val = ROLE_MANAGER;
+            if (role_val < ROLE_ADMIN || role_val > ROLE_INVENTORY_MANAGER) role_val = ROLE_MANAGER;
             active_user_role = (UserRole)role_val;
             if (strlen(pin_line) > 0) {
                 strncpy(manager_override_pin, pin_line, NAME_LEN - 1);
@@ -4754,6 +5840,9 @@ static void add_customer_dialog(Store *s) {
     GtkWidget *email_entry = create_labeled_entry("Email:", vbox);
     GtkWidget *phone1_entry = create_labeled_entry("Primary Phone:", vbox);
     GtkWidget *phone2_entry = create_labeled_entry("Secondary Phone:", vbox);
+    GtkWidget *gender_entry = create_labeled_entry("Gender:", vbox);
+    GtkWidget *birthdate_entry = create_labeled_entry("Birthdate (YYYY-MM-DD):", vbox);
+    GtkWidget *group_entry = create_labeled_entry("Customer Group:", vbox);
 
     // Preferred contact
     GtkWidget *pref_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
@@ -4826,6 +5915,9 @@ static void add_customer_dialog(Store *s) {
         strncpy(c->email, gtk_entry_get_text(GTK_ENTRY(email_entry)), NAME_LEN - 1);
         strncpy(c->phone1, gtk_entry_get_text(GTK_ENTRY(phone1_entry)), NAME_LEN - 1);
         strncpy(c->phone2, gtk_entry_get_text(GTK_ENTRY(phone2_entry)), NAME_LEN - 1);
+        strncpy(c->gender, gtk_entry_get_text(GTK_ENTRY(gender_entry)), NAME_LEN - 1);
+        strncpy(c->birthdate, gtk_entry_get_text(GTK_ENTRY(birthdate_entry)), NAME_LEN - 1);
+        strncpy(c->customer_group, gtk_entry_get_text(GTK_ENTRY(group_entry)), NAME_LEN - 1);
         c->preferred_contact = gtk_combo_box_get_active(GTK_COMBO_BOX(pref_combo));
 
         strncpy(c->billing_addr1, gtk_entry_get_text(GTK_ENTRY(bill_addr1)), NAME_LEN - 1);
@@ -4853,6 +5945,9 @@ static void add_customer_dialog(Store *s) {
         g_free(notes);
 
         c->hidden = 0;
+        get_today_date(c->customer_since, sizeof(c->customer_since));
+        strncpy(c->last_visit, c->customer_since, NAME_LEN - 1);
+        c->last_visit[NAME_LEN - 1] = '\0';
         s->customer_count++;
         show_info_dialog("Customer added successfully.");
     }
@@ -4882,13 +5977,15 @@ static void list_customers_dialog(Store *s) {
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(list_sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_box_pack_start(GTK_BOX(vbox), list_sw, TRUE, TRUE, 0);
 
-    GtkListStore *store_list = gtk_list_store_new(6,
+    GtkListStore *store_list = gtk_list_store_new(8,
                                                    G_TYPE_INT,     // customer index
                                                    G_TYPE_STRING,  // name
                                                    G_TYPE_STRING,  // company
                                                    G_TYPE_STRING,  // email
                                                    G_TYPE_STRING,  // poa status
-                                                   G_TYPE_STRING); // credit limit
+                                                   G_TYPE_STRING,  // credit limit
+                                                   G_TYPE_STRING,  // group
+                                                   G_TYPE_STRING); // last visit
 
     GtkTreeView *tree = GTK_TREE_VIEW(gtk_tree_view_new_with_model(GTK_TREE_MODEL(store_list)));
     
@@ -4898,6 +5995,8 @@ static void list_customers_dialog(Store *s) {
     gtk_tree_view_insert_column_with_attributes(tree, -1, "Email", renderer, "text", 3, NULL);
     gtk_tree_view_insert_column_with_attributes(tree, -1, "POA Status", renderer, "text", 4, NULL);
     gtk_tree_view_insert_column_with_attributes(tree, -1, "Credit Limit", renderer, "text", 5, NULL);
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "Group", renderer, "text", 6, NULL);
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "Last Visit", renderer, "text", 7, NULL);
 
     // Populate list
     for (int i = 0; i < s->customer_count; i++) {
@@ -4908,6 +6007,10 @@ static void list_customers_dialog(Store *s) {
         const char *poa_names[] = {"Inactive", "Active", "Suspended", "Closed"};
         char credit[30];
         sprintf(credit, "%.2f", c->credit_limit);
+        int days = days_ago_from_date(c->last_visit);
+        char last_visit[80];
+        if (days >= 0) snprintf(last_visit, sizeof(last_visit), "%s (%d days ago)", c->last_visit, days);
+        else snprintf(last_visit, sizeof(last_visit), "%s", c->last_visit);
 
         GtkTreeIter iter;
         gtk_list_store_append(store_list, &iter);
@@ -4918,6 +6021,8 @@ static void list_customers_dialog(Store *s) {
                           3, c->email,
                           4, poa_names[c->poa_status],
                           5, credit,
+                          6, c->customer_group,
+                          7, last_visit,
                           -1);
     }
 
@@ -4944,6 +6049,10 @@ static void create_sale_dialog(void) {
     int si = choose_store_index();
     if (si < 0) return;
     Store *s = &stores[si];
+
+    if (strlen(system_sales_popup_message) > 0) {
+        show_info_dialog(system_sales_popup_message);
+    }
 
     if (s->customer_count == 0) {
         show_error_dialog("No customers in this store. Add a customer first.");
@@ -5195,6 +6304,45 @@ static void create_sale_dialog(void) {
     sprintf(total_str, "%.2f", txn.total);
     gtk_entry_set_text(GTK_ENTRY(amount_entry), total_str);
 
+    GtkWidget *split_frame = gtk_frame_new("Split Payments (optional)");
+    gtk_box_pack_start(GTK_BOX(pay_box), split_frame, FALSE, FALSE, 0);
+    GtkWidget *split_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(split_vbox), 6);
+    gtk_container_add(GTK_CONTAINER(split_frame), split_vbox);
+
+    GtkWidget *split_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_box_pack_start(GTK_BOX(split_vbox), split_row, FALSE, FALSE, 0);
+    GtkWidget *split_method_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(split_method_combo), "Cash");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(split_method_combo), "Credit Card");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(split_method_combo), "Debit Card");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(split_method_combo), "Gift Card");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(split_method_combo), "Financing");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(split_method_combo), "Check");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(split_method_combo), "Trade-In");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(split_method_combo), "On Account");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(split_method_combo), 0);
+    GtkWidget *split_amount_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(split_amount_entry), "Amount");
+    GtkWidget *split_add_btn = gtk_button_new_with_label("Add Split Line");
+    gtk_box_pack_start(GTK_BOX(split_row), gtk_label_new("Method:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(split_row), split_method_combo, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(split_row), gtk_label_new("Amount:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(split_row), split_amount_entry, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(split_row), split_add_btn, FALSE, FALSE, 0);
+
+    GtkListStore *split_store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_DOUBLE);
+    GtkWidget *split_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(split_store));
+    GtkCellRenderer *split_renderer = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(split_tree), -1, "Method", split_renderer, "text", 0, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(split_tree), -1, "Amount", split_renderer, "text", 1, NULL);
+    GtkWidget *split_sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_size_request(split_sw, 460, 100);
+    gtk_container_add(GTK_CONTAINER(split_sw), split_tree);
+    gtk_box_pack_start(GTK_BOX(split_vbox), split_sw, FALSE, FALSE, 0);
+    GtkWidget *split_total_label = gtk_label_new("Split Entered: $0.00");
+    gtk_box_pack_start(GTK_BOX(split_vbox), split_total_label, FALSE, FALSE, 0);
+
     GtkWidget *receipt_checkbox = gtk_check_button_new_with_label("Print Receipt");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(receipt_checkbox), TRUE);
     gtk_box_pack_start(GTK_BOX(pay_box), receipt_checkbox, FALSE, FALSE, 0);
@@ -5202,13 +6350,33 @@ static void create_sale_dialog(void) {
     GtkWidget *keep_open_checkbox = gtk_check_button_new_with_label("Keep transaction open");
     gtk_box_pack_start(GTK_BOX(pay_box), keep_open_checkbox, FALSE, FALSE, 0);
 
+    g_object_set_data(G_OBJECT(pay_dialog), "split_store", split_store);
+    g_object_set_data(G_OBJECT(pay_dialog), "split_method_combo", split_method_combo);
+    g_object_set_data(G_OBJECT(pay_dialog), "split_amount_entry", split_amount_entry);
+    g_object_set_data(G_OBJECT(pay_dialog), "split_total_label", split_total_label);
+    g_signal_connect(split_add_btn, "clicked", G_CALLBACK(on_add_split_payment_line_clicked), pay_dialog);
+
     gtk_widget_show_all(pay_dialog);
 
     if (gtk_dialog_run(GTK_DIALOG(pay_dialog)) == 1) {
-        txn.amount_paid = atof(gtk_entry_get_text(GTK_ENTRY(amount_entry)));
+        double split_total = sum_split_payment_rows(GTK_TREE_MODEL(split_store));
+        int use_split = split_total > 0.0;
+        txn.amount_paid = use_split ? split_total : atof(gtk_entry_get_text(GTK_ENTRY(amount_entry)));
         txn.payment_type = gtk_combo_box_get_active(GTK_COMBO_BOX(payment_type_combo));
         txn.print_receipt = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(receipt_checkbox));
         int keep_open = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(keep_open_checkbox));
+
+        if (use_split) {
+            GtkTreeIter split_iter;
+            if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(split_store), &split_iter)) {
+                char *method = NULL;
+                gtk_tree_model_get(GTK_TREE_MODEL(split_store), &split_iter, 0, &method, -1);
+                if (method) {
+                    txn.payment_type = payment_type_from_method_text(method);
+                    g_free(method);
+                }
+            }
+        }
 
         if (txn.amount_paid >= txn.total) {
             if (keep_open) {
@@ -5220,10 +6388,30 @@ static void create_sale_dialog(void) {
             s->sales_count++;
             s->sales[s->sales_count - 1] = txn;
             s->transactions++;
-            add_payment_ledger_entry(si, txn.transaction_id,
-                                     (txn.payment_type >= PAYMENT_CASH && txn.payment_type <= PAYMENT_GIFT) ? payment_names[txn.payment_type] : "Other",
-                                     txn.amount_paid,
-                                     "Initial payment");
+
+            if (txn.customer_idx >= 0 && txn.customer_idx < s->customer_count) {
+                get_today_date(s->customers[txn.customer_idx].last_visit, sizeof(s->customers[txn.customer_idx].last_visit));
+            }
+
+            if (use_split) {
+                GtkTreeIter split_iter;
+                gboolean split_valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(split_store), &split_iter);
+                while (split_valid) {
+                    char *method = NULL;
+                    double amount = 0.0;
+                    gtk_tree_model_get(GTK_TREE_MODEL(split_store), &split_iter, 0, &method, 1, &amount, -1);
+                    if (method && amount > 0.0) {
+                        add_payment_ledger_entry(si, txn.transaction_id, method, amount, "Initial payment");
+                    }
+                    if (method) g_free(method);
+                    split_valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(split_store), &split_iter);
+                }
+            } else {
+                add_payment_ledger_entry(si, txn.transaction_id,
+                                         (txn.payment_type >= PAYMENT_CASH && txn.payment_type <= PAYMENT_GIFT) ? payment_names[txn.payment_type] : "Other",
+                                         txn.amount_paid,
+                                         "Initial payment");
+            }
 
             char change_str[100];
             double change = txn.amount_paid - txn.total;
@@ -5261,14 +6449,51 @@ static void create_sale_dialog(void) {
 
                 show_info_dialog(receipt);
             }
+
+            if (trek_auto_register) {
+                for (int i = 0; i < txn.item_count; i++) {
+                    Product *p = NULL;
+                    for (int j = 0; j < s->product_count; j++) {
+                        if (strcmp(s->products[j].sku, txn.item_sku[i]) == 0) {
+                            p = &s->products[j];
+                            break;
+                        }
+                    }
+                    if (p && p->serialized && strcasecmp(p->vendor, "Trek") == 0) {
+                        char details[220];
+                        snprintf(details, sizeof(details), "Auto-registration prompt queued Txn:%s SKU:%s Serial:%s", txn.transaction_id, txn.item_sku[i], txn.so_comments[i]);
+                        add_audit_log_entry(current_sales_user, "TrekAutoRegistration", details);
+                    }
+                }
+            }
         } else {
             txn.status = 0; // open/layaway
             s->sales_count++;
             s->sales[s->sales_count - 1] = txn;
-            add_payment_ledger_entry(si, txn.transaction_id,
-                                     (txn.payment_type >= PAYMENT_CASH && txn.payment_type <= PAYMENT_GIFT) ? payment_names[txn.payment_type] : "Other",
-                                     txn.amount_paid,
-                                     "Layaway opening payment");
+
+            if (txn.customer_idx >= 0 && txn.customer_idx < s->customer_count) {
+                get_today_date(s->customers[txn.customer_idx].last_visit, sizeof(s->customers[txn.customer_idx].last_visit));
+            }
+
+            if (use_split) {
+                GtkTreeIter split_iter;
+                gboolean split_valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(split_store), &split_iter);
+                while (split_valid) {
+                    char *method = NULL;
+                    double amount = 0.0;
+                    gtk_tree_model_get(GTK_TREE_MODEL(split_store), &split_iter, 0, &method, 1, &amount, -1);
+                    if (method && amount > 0.0) {
+                        add_payment_ledger_entry(si, txn.transaction_id, method, amount, "Layaway opening payment");
+                    }
+                    if (method) g_free(method);
+                    split_valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(split_store), &split_iter);
+                }
+            } else {
+                add_payment_ledger_entry(si, txn.transaction_id,
+                                         (txn.payment_type >= PAYMENT_CASH && txn.payment_type <= PAYMENT_GIFT) ? payment_names[txn.payment_type] : "Other",
+                                         txn.amount_paid,
+                                         "Layaway opening payment");
+            }
 
             char msg[150];
             double remaining = txn.total - txn.amount_paid;
@@ -5582,7 +6807,7 @@ static double layaway_get_tax_rate(LayawayWorkbenchContext *ctx) {
     if (idx == 0) return 0.00;
     if (idx == 1) return 0.04;
     if (idx == 2) return 0.07;
-    return 0.0825;
+    return app_settings.default_tax_rate;
 }
 
 static void layaway_recalc_totals(LayawayWorkbenchContext *ctx) {
@@ -6357,7 +7582,11 @@ static void layaway_workbench_dialog(Store *s, int store_idx, int customer_idx) 
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->tax_rate_combo), "Tax 0% (Exempt)");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->tax_rate_combo), "Tax 4%");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->tax_rate_combo), "Tax 7%");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->tax_rate_combo), "Tax 8.25%");
+    {
+        char default_label[64];
+        snprintf(default_label, sizeof(default_label), "Tax Default (%.4f)", app_settings.default_tax_rate);
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->tax_rate_combo), default_label);
+    }
     gtk_combo_box_set_active(GTK_COMBO_BOX(ctx->tax_rate_combo), 3);
     gtk_box_pack_start(GTK_BOX(totals_box), ctx->tax_rate_combo, FALSE, FALSE, 0);
     ctx->shipping_entry = create_labeled_entry("Shipping:", totals_box);
@@ -7036,6 +8265,10 @@ static void complete_sale_dialog(void) {
                     // Complete the transaction
                     found_txn->status = 1; // completed
                     s->sales_to_date += found_txn->total;
+
+                    if (found_txn->customer_idx >= 0 && found_txn->customer_idx < s->customer_count) {
+                        get_today_date(s->customers[found_txn->customer_idx].last_visit, sizeof(s->customers[found_txn->customer_idx].last_visit));
+                    }
 
                     // Update product stock (reduce inventory since items are now sold)
                     for (int i = 0; i < found_txn->item_count; i++) {
@@ -7875,13 +9108,16 @@ static void send_special_order_notifications(GtkWidget *widget, gpointer data) {
 int main(int argc, char *argv[]) {
     gtk_init(&argc, &argv);
 
+    load_data();
+
     main_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(main_window), "Ascend Retail Platform");
-    gtk_window_set_default_size(GTK_WINDOW(main_window), 500, 400);
+    gtk_window_set_default_size(GTK_WINDOW(main_window), mobile_floor_mode_enabled ? 900 : 500, mobile_floor_mode_enabled ? 650 : 400);
     g_signal_connect(main_window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
     g_signal_connect(main_window, "key-press-event", G_CALLBACK(on_main_window_key_press), NULL);
 
     show_main_menu();
+    apply_visual_theme(active_theme_mode);
 
     gtk_main();
 
