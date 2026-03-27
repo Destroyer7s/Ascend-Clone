@@ -42,3 +42,9 @@ gcc -std=c11 -Wall -o ascend main_gtk.c $(pkg-config --cflags --libs gtk+-3.0)
 
 All store data is saved to `ascend_data.txt` in the working directory automatically when you click **Save** or perform certain actions.
 
+## Program Instructions
+
+For a full operations manual with quick references and keyword index, see:
+
+- [PROGRAM_INSTRUCTIONS.md](PROGRAM_INSTRUCTIONS.md)
+
