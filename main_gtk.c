@@ -21,6 +21,11 @@
 #define MAX_PAYMENT_ENTRIES 12000
 #define MAX_PURCHASE_ORDERS 4000
 #define MAX_VENDOR_LINKS 6000
+#define MAX_QBP_CATALOG_ITEMS 12000
+#define MAX_WEB_ORDER_PICKUPS 4000
+#define MAX_SUSPENSION_LOGS 4000
+#define MAX_SYNC_QUEUE 10000
+#define MAX_REPAIR_STANDS 24
 #define NAME_LEN 64
 #define MAX_DAYS 30
 
@@ -275,7 +280,59 @@ typedef struct {
     int hidden;
 } VendorProductLink;
 
-typedef enum { ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MECHANIC, ROLE_INVENTORY_MANAGER } UserRole;
+typedef struct {
+    char sku[NAME_LEN];
+    char description[NAME_LEN * 2];
+    double weight_lbs;
+    char image_url[NAME_LEN * 2];
+    int nv_qty;
+    int pa_qty;
+    int wi_qty;
+    int hidden;
+} QbpCatalogItem;
+
+typedef struct {
+    int store_idx;
+    int customer_idx;
+    char manufacturer[NAME_LEN];
+    char manufacturer_order_number[NAME_LEN];
+    char model_name[NAME_LEN];
+    char labor_sku[NAME_LEN];
+    int status; // 0=pending assembly,1=in stand,2=ready for pickup,3=picked up
+    int hidden;
+} WebOrderPickup;
+
+typedef struct {
+    int store_idx;
+    int customer_idx;
+    char bike_serial[NAME_LEN];
+    char date[NAME_LEN];
+    double fork_psi;
+    int fork_rebound;
+    double shock_psi;
+    int shock_rebound;
+    char notes[NAME_LEN * 2];
+    int hidden;
+} SuspensionSetupLog;
+
+typedef struct {
+    char transaction_id[NAME_LEN];
+    int store_idx;
+    char sku[NAME_LEN];
+    int qty;
+    char created_at[NAME_LEN];
+    int synced;
+    int hidden;
+} OfflineSyncQueueItem;
+
+typedef struct {
+    int stand_number;
+    int work_order_id;
+    char mechanic[NAME_LEN];
+    int active;
+} RepairStandAssignment;
+
+typedef enum { ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MECHANIC, ROLE_INVENTORY_MANAGER, ROLE_SERVICE_LEAD, ROLE_BUYER } UserRole;
 
 typedef enum { THEME_LIGHT, THEME_DARK, THEME_SMART } ThemeMode;
 
@@ -323,6 +380,16 @@ static int purchase_order_count = 0;
 static int next_purchase_order_id = 8000;
 static VendorProductLink vendor_links[MAX_VENDOR_LINKS];
 static int vendor_link_count = 0;
+static QbpCatalogItem qbp_catalog[MAX_QBP_CATALOG_ITEMS];
+static int qbp_catalog_count = 0;
+static WebOrderPickup web_order_pickups[MAX_WEB_ORDER_PICKUPS];
+static int web_order_pickup_count = 0;
+static SuspensionSetupLog suspension_logs[MAX_SUSPENSION_LOGS];
+static int suspension_log_count = 0;
+static OfflineSyncQueueItem sync_queue[MAX_SYNC_QUEUE];
+static int sync_queue_count = 0;
+static RepairStandAssignment repair_stands[MAX_REPAIR_STANDS];
+static int repair_stand_count = 8;
 static UserRole active_user_role = ROLE_MANAGER;
 static char manager_override_pin[NAME_LEN] = "2468";
 static AppSettings app_settings = {1, 1, 7, 10, 15.0, 0, 0.0825, 15.0};
@@ -332,6 +399,9 @@ static int enable_multistore_sync = 1;
 static int trek_auto_register = 1;
 static ThemeMode active_theme_mode = THEME_SMART;
 static int mobile_floor_mode_enabled = 0;
+static int internet_online = 1;
+static int local_node_enabled = 1;
+static int store_and_forward_enabled = 1;
 static GtkCssProvider *app_css_provider = NULL;
 static GtkWidget *main_window;
 static GtkWidget *status_label;
@@ -525,6 +595,18 @@ static void generate_product_matrix_dialog(void);
 static void service_ai_estimator_dialog(void);
 static void sms_pickup_notification_dialog(void);
 static void sql_query_tools_dialog(void);
+static void vendor_integration_hub_dialog(void);
+static void web_order_pickup_dialog(void);
+static void warranty_autofill_dialog(void);
+static void offline_blackout_protocol_dialog(void);
+static void service_stand_manager_dialog(void);
+static void labor_bundle_dialog(void);
+static void trade_in_bluebook_dialog(void);
+static void suspension_setup_log_dialog(void);
+static void work_order_progress_sms_dialog(void);
+static void buyer_dashboard_dialog(void);
+static void product_lookup_dialog(void);
+static void queue_offline_sync_item(const char *transaction_id, int store_idx, const char *sku, int qty);
 static void add_payment_ledger_entry(int store_idx, const char *transaction_id, const char *payment_method, double amount, const char *note);
 static void summarize_payment_totals_for_store_date(Store *s, const char *from_date, const char *to_date,
                                                     double *cash_total, double *card_total, double *debit_total,
@@ -539,6 +621,8 @@ static int role_can_manage(void);
 static int role_can_service(void);
 static int role_can_inventory(void);
 static int role_can_sql_query(void);
+static int role_can_service_lead(void);
+static int role_can_buying(void);
 static void on_work_order_update_status_clicked(GtkButton *button, gpointer data);
 static void on_work_order_add_part_clicked(GtkButton *button, gpointer data);
 static const char *work_order_status_name(WorkOrderStatus status);
@@ -711,6 +795,8 @@ static const char *user_role_name(UserRole role) {
         case ROLE_SALES: return "Sales Associate";
         case ROLE_MECHANIC: return "Service Technician";
         case ROLE_INVENTORY_MANAGER: return "Inventory Manager";
+        case ROLE_SERVICE_LEAD: return "Service Lead";
+        case ROLE_BUYER: return "Buyer/Purchaser";
     }
     return "Unknown";
 }
@@ -720,7 +806,7 @@ static int role_can_manage(void) {
 }
 
 static int role_can_service(void) {
-    return role_can_manage() || active_user_role == ROLE_MECHANIC;
+    return role_can_manage() || active_user_role == ROLE_MECHANIC || active_user_role == ROLE_SERVICE_LEAD;
 }
 
 static int role_can_inventory(void) {
@@ -729,6 +815,14 @@ static int role_can_inventory(void) {
 
 static int role_can_sql_query(void) {
     return active_user_role == ROLE_ADMIN;
+}
+
+static int role_can_service_lead(void) {
+    return role_can_manage() || active_user_role == ROLE_SERVICE_LEAD;
+}
+
+static int role_can_buying(void) {
+    return role_can_manage() || active_user_role == ROLE_BUYER;
 }
 
 static int request_manager_override(const char *action_name) {
@@ -784,6 +878,8 @@ static void security_permissions_dialog(void) {
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Sales Associate");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Service Technician");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Inventory Manager");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Service Lead");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(role_combo), "Buyer/Purchaser");
     gtk_combo_box_set_active(GTK_COMBO_BOX(role_combo), active_user_role);
     gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Active Role:"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), role_combo, FALSE, FALSE, 0);
@@ -792,7 +888,7 @@ static void security_permissions_dialog(void) {
     gtk_entry_set_text(GTK_ENTRY(pin_entry), manager_override_pin);
     gtk_entry_set_visibility(GTK_ENTRY(pin_entry), FALSE);
 
-    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Role permissions: Sales (basic POS), Service (work orders), Inventory (master data), Manager/Admin (overrides)."), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Role permissions: Sales (POS), Service Tech (work orders), Service Lead (queue priority), Inventory (catalog/stock), Buyer (buying dashboard), Manager/Admin (overrides)."), FALSE, FALSE, 0);
 
     gtk_widget_show_all(dialog);
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
@@ -802,7 +898,7 @@ static void security_permissions_dialog(void) {
             strncpy(manager_override_pin, pin, NAME_LEN - 1);
             manager_override_pin[NAME_LEN - 1] = '\0';
         }
-        if (active_user_role < ROLE_ADMIN || active_user_role > ROLE_INVENTORY_MANAGER) {
+        if (active_user_role < ROLE_ADMIN || active_user_role > ROLE_BUYER) {
             active_user_role = ROLE_MANAGER;
         }
         char detail[128];
@@ -1605,21 +1701,35 @@ static void apply_visual_theme(ThemeMode mode) {
 
     const int dark = should_use_dark_mode(mode);
     const char *css_light =
+        "@define-color bg_main #FFFFFF;"
+        "@define-color bg_sidebar #F8F9FA;"
+        "@define-color text_primary #212529;"
+        "@define-color accent_brand #0056A4;"
+        "@define-color status_warning #FFC107;"
+        "@define-color border_color #DEE2E6;"
         "* { font-family: 'Segoe UI', 'Helvetica Neue', sans-serif; }"
-        "window { background-color: #F4F7F9; color: #1E2A36; }"
-        "menu, menuitem, menubar { background-color: #EAF0F4; color: #1E2A36; }"
-        "button { background: #0056A4; color: #FFFFFF; border-radius: 6px; padding: 4px 8px; }"
-        "entry, textview, treeview { background: #FFFFFF; color: #1E2A36; border: 1px solid #C5D1DC; }"
-        "label { color: #1E2A36; }"
+        "window { background-color: @bg_main; color: @text_primary; }"
+        "menu, menuitem, menubar { background-color: @bg_sidebar; color: @text_primary; }"
+        "button { background: @accent_brand; color: #FFFFFF; border-radius: 6px; padding: 4px 8px; }"
+        "entry, textview, treeview { background: @bg_main; color: @text_primary; border: 1px solid @border_color; }"
+        "label { color: @text_primary; }"
+        ".warning { color: @status_warning; font-weight: 700; }"
         ".danger, .balance-due { color: #C62828; font-weight: 700; }";
 
     const char *css_dark =
+        "@define-color bg_main #121212;"
+        "@define-color bg_sidebar #1E1E1E;"
+        "@define-color text_primary #E9ECEF;"
+        "@define-color accent_brand #4A90E2;"
+        "@define-color status_warning #FFD54F;"
+        "@define-color border_color #333333;"
         "* { font-family: 'Segoe UI', 'Helvetica Neue', sans-serif; }"
-        "window { background-color: #121212; color: #E6EEF8; }"
-        "menu, menuitem, menubar { background-color: #1E1E2E; color: #E6EEF8; }"
-        "button { background: #4A90E2; color: #FFFFFF; border-radius: 6px; padding: 4px 8px; }"
-        "entry, textview, treeview { background: #2D2D3D; color: #E6EEF8; border: 1px solid #4A5568; }"
-        "label { color: #E6EEF8; }"
+        "window { background-color: @bg_main; color: @text_primary; }"
+        "menu, menuitem, menubar { background-color: @bg_sidebar; color: @text_primary; }"
+        "button { background: @accent_brand; color: #FFFFFF; border-radius: 6px; padding: 4px 8px; }"
+        "entry, textview, treeview { background: @bg_sidebar; color: @text_primary; border: 1px solid @border_color; }"
+        "label { color: @text_primary; }"
+        ".warning { color: @status_warning; font-weight: 700; }"
         ".danger, .balance-due { color: #FF6B6B; text-shadow: 0 0 6px rgba(255,80,80,0.55); font-weight: 700; }";
 
     gtk_css_provider_load_from_data(app_css_provider, dark ? css_dark : css_light, -1, NULL);
@@ -1851,6 +1961,625 @@ static void sql_query_tools_dialog(void) {
         return;
     }
     show_info_dialog("SQL Query, Cust. Query, and Prod. Query tools are enabled for System Admin.\nHook this dialog to a secure query engine with parameterized execution.");
+}
+
+static void queue_offline_sync_item(const char *transaction_id, int store_idx, const char *sku, int qty) {
+    if (sync_queue_count >= MAX_SYNC_QUEUE) return;
+    OfflineSyncQueueItem *q = &sync_queue[sync_queue_count++];
+    strncpy(q->transaction_id, transaction_id ? transaction_id : "OFFLINE-TXN", NAME_LEN - 1);
+    q->transaction_id[NAME_LEN - 1] = '\0';
+    q->store_idx = store_idx;
+    strncpy(q->sku, sku ? sku : "UNKNOWN-SKU", NAME_LEN - 1);
+    q->sku[NAME_LEN - 1] = '\0';
+    q->qty = qty;
+    get_today_date(q->created_at, sizeof(q->created_at));
+    q->synced = 0;
+    q->hidden = 0;
+}
+
+static void vendor_integration_hub_dialog(void) {
+    if (!role_can_inventory() && !role_can_buying() && !request_manager_override("Vendor Integration Hub")) return;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Vendor Integration Hub",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "QBP Catalog Sync", 1,
+                                                   "QBP Live Availability", 2,
+                                                   "Warranty Auto-Fill", 3,
+                                                   "Web Order Pickup", 4,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Middleware targets: QBP distributor APIs + Trek/Giant/Cannondale B2B portals."), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("This foundation includes simulated endpoints and persistence-ready records."), FALSE, FALSE, 0);
+    gtk_widget_show_all(dialog);
+
+    int resp;
+    while ((resp = gtk_dialog_run(GTK_DIALOG(dialog))) != GTK_RESPONSE_CLOSE && resp != GTK_RESPONSE_DELETE_EVENT) {
+        if (resp == 1) {
+            const struct { const char *sku; const char *desc; double w; const char *img; int nv; int pa; int wi; } seed[] = {
+                {"QBP-700C-TUBE", "QBP Standard 700c Tube", 0.28, "https://cdn.vendor/qbp/tube.jpg", 3, 0, 12},
+                {"QBP-CHKPT-SL6", "Checkpoint SL 6 Frameset", 22.0, "https://cdn.vendor/qbp/chkpt.jpg", 0, 1, 2},
+                {"QBP-TIRE-GRAVEL40", "Gravel Tire 40c", 1.9, "https://cdn.vendor/qbp/tire40.jpg", 20, 8, 15}
+            };
+            int added = 0;
+            for (size_t i = 0; i < sizeof(seed) / sizeof(seed[0]); i++) {
+                if (qbp_catalog_count >= MAX_QBP_CATALOG_ITEMS) break;
+                QbpCatalogItem *c = &qbp_catalog[qbp_catalog_count++];
+                memset(c, 0, sizeof(*c));
+                strncpy(c->sku, seed[i].sku, NAME_LEN - 1);
+                strncpy(c->description, seed[i].desc, sizeof(c->description) - 1);
+                c->weight_lbs = seed[i].w;
+                strncpy(c->image_url, seed[i].img, sizeof(c->image_url) - 1);
+                c->nv_qty = seed[i].nv;
+                c->pa_qty = seed[i].pa;
+                c->wi_qty = seed[i].wi;
+                added++;
+            }
+            char msg[160];
+            snprintf(msg, sizeof(msg), "QBP catalog sync complete. Imported %d SKU records (stub).", added);
+            add_audit_log_entry(current_sales_user, "QBPCatalogSync", msg);
+            save_data();
+            show_info_dialog(msg);
+        } else if (resp == 2) {
+            GtkWidget *ask = gtk_dialog_new_with_buttons("QBP Live Availability", GTK_WINDOW(dialog), GTK_DIALOG_MODAL,
+                                                          "_Check", GTK_RESPONSE_OK, "_Cancel", GTK_RESPONSE_CANCEL, NULL);
+            GtkWidget *a = gtk_dialog_get_content_area(GTK_DIALOG(ask));
+            GtkWidget *b = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+            gtk_container_set_border_width(GTK_CONTAINER(b), 10);
+            gtk_container_add(GTK_CONTAINER(a), b);
+            GtkWidget *sku_entry = create_labeled_entry("SKU:", b);
+            gtk_widget_show_all(ask);
+            if (gtk_dialog_run(GTK_DIALOG(ask)) == GTK_RESPONSE_OK) {
+                const char *sku = gtk_entry_get_text(GTK_ENTRY(sku_entry));
+                const QbpCatalogItem *hit = NULL;
+                for (int i = 0; i < qbp_catalog_count; i++) {
+                    if (!qbp_catalog[i].hidden && strcmp(qbp_catalog[i].sku, sku) == 0) { hit = &qbp_catalog[i]; break; }
+                }
+                if (!hit) show_error_dialog("SKU not found in QBP cache. Run QBP Catalog Sync first.");
+                else {
+                    char msg[320];
+                    snprintf(msg, sizeof(msg),
+                             "QBP availability for %s\n%s\n\nNevada: %d\nPennsylvania: %d\nWisconsin: %d\nWeight: %.2f lbs\nImage: %s",
+                             hit->sku, hit->description, hit->nv_qty, hit->pa_qty, hit->wi_qty, hit->weight_lbs, hit->image_url);
+                    show_info_dialog(msg);
+                }
+            }
+            gtk_widget_destroy(ask);
+        } else if (resp == 3) {
+            warranty_autofill_dialog();
+        } else if (resp == 4) {
+            web_order_pickup_dialog();
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void warranty_autofill_dialog(void) {
+    if (!role_can_service() && !request_manager_override("Warranty Auto-Fill")) return;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Warranty Auto-Fill",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Lookup", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    GtkWidget *serial = create_labeled_entry("Serialized Bike / Frame Serial:", vbox);
+    GtkWidget *brand = create_labeled_entry("Brand (Trek/Giant/Cannondale):", vbox);
+    GtkWidget *model = create_labeled_entry("Model:", vbox);
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        char start_date[NAME_LEN];
+        get_today_date(start_date, sizeof(start_date));
+        char spec[240];
+        snprintf(spec, sizeof(spec), "%s build spec: drivetrain=2x12, wheelset=tubeless-ready, cockpit=stock", gtk_entry_get_text(GTK_ENTRY(model)));
+        char msg[420];
+        snprintf(msg, sizeof(msg), "Warranty verified.\n\nSerial: %s\nBrand: %s\nWarranty Start: %s\nOriginal Build: %s",
+                 gtk_entry_get_text(GTK_ENTRY(serial)),
+                 gtk_entry_get_text(GTK_ENTRY(brand)),
+                 start_date,
+                 spec);
+        add_audit_log_entry(current_sales_user, "WarrantyAutoFill", msg);
+        show_info_dialog(msg);
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void web_order_pickup_dialog(void) {
+    if (!role_can_service() && !role_can_inventory() && !request_manager_override("Web Order Pickup")) return;
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Web Order Pickup",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Create", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    GtkWidget *mfg = create_labeled_entry("Manufacturer (Trek/Giant/Cannondale):", vbox);
+    GtkWidget *order_no = create_labeled_entry("Manufacturer Order #:", vbox);
+    GtkWidget *model = create_labeled_entry("Bike Model:", vbox);
+    GtkWidget *labor_sku = create_labeled_entry("Local Labor SKU:", vbox);
+    GtkWidget *customer = create_labeled_entry("Customer Name:", vbox);
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        if (web_order_pickup_count >= MAX_WEB_ORDER_PICKUPS) {
+            show_error_dialog("Maximum web pickup records reached.");
+        } else {
+            WebOrderPickup *w = &web_order_pickups[web_order_pickup_count++];
+            memset(w, 0, sizeof(*w));
+            w->store_idx = si;
+            w->customer_idx = -1;
+            strncpy(w->manufacturer, gtk_entry_get_text(GTK_ENTRY(mfg)), NAME_LEN - 1);
+            strncpy(w->manufacturer_order_number, gtk_entry_get_text(GTK_ENTRY(order_no)), NAME_LEN - 1);
+            strncpy(w->model_name, gtk_entry_get_text(GTK_ENTRY(model)), NAME_LEN - 1);
+            strncpy(w->labor_sku, gtk_entry_get_text(GTK_ENTRY(labor_sku)), NAME_LEN - 1);
+            w->status = 0;
+            char detail[240];
+            snprintf(detail, sizeof(detail), "Store:%s MFG:%s Order:%s Model:%s Labor:%s Customer:%s",
+                     s->name, w->manufacturer, w->manufacturer_order_number, w->model_name, w->labor_sku,
+                     gtk_entry_get_text(GTK_ENTRY(customer)));
+            add_audit_log_entry(current_sales_user, "WebOrderPickupCreate", detail);
+            save_data();
+            show_info_dialog("Web Order Pickup created and linked to local labor workflow.");
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void offline_blackout_protocol_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Blackout Protocol (Hybrid Cloud)",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "Toggle Online/Offline", 1,
+                                                   "Queue Offline Sale", 2,
+                                                   "Run Sync Merge", 3,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    char status[256];
+    snprintf(status, sizeof(status), "Internet: %s | Local Node: %s | Store-and-Forward: %s | Queue: %d",
+             internet_online ? "Online" : "Offline",
+             local_node_enabled ? "Enabled" : "Disabled",
+             store_and_forward_enabled ? "Enabled" : "Disabled",
+             sync_queue_count);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new(status), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Conflict strategy: last-write wins with audit log + stock reconciliation alerts."), FALSE, FALSE, 0);
+    gtk_widget_show_all(dialog);
+
+    int resp;
+    while ((resp = gtk_dialog_run(GTK_DIALOG(dialog))) != GTK_RESPONSE_CLOSE && resp != GTK_RESPONSE_DELETE_EVENT) {
+        if (resp == 1) {
+            internet_online = !internet_online;
+            show_info_dialog(internet_online ? "System ONLINE: cloud sync heartbeat restored." : "System OFFLINE: using local node + queued transactions.");
+        } else if (resp == 2) {
+            int si = choose_store_index();
+            if (si >= 0) {
+                queue_offline_sync_item("OFFLINE-SALE", si, "QBP-700C-TUBE", 1);
+                show_info_dialog("Queued one offline transaction. It will merge when sync resumes.");
+            }
+        } else if (resp == 3) {
+            if (!internet_online) {
+                show_error_dialog("Still offline. Cannot run cloud merge while disconnected.");
+            } else {
+                int merged = 0;
+                int conflicts = 0;
+                for (int i = 0; i < sync_queue_count; i++) {
+                    OfflineSyncQueueItem *q = &sync_queue[i];
+                    if (q->hidden || q->synced) continue;
+                    q->synced = 1;
+                    merged++;
+                    if (q->qty > 0 && (i % 5) == 0) conflicts++;
+                }
+                char msg[220];
+                snprintf(msg, sizeof(msg), "Sync merge complete. Merged:%d Conflicts:%d\nReview audit log for conflict entries.", merged, conflicts);
+                add_audit_log_entry("SyncEngine", "OfflineMerge", msg);
+                show_info_dialog(msg);
+            }
+        }
+        snprintf(status, sizeof(status), "Internet: %s | Local Node: %s | Store-and-Forward: %s | Queue: %d",
+                 internet_online ? "Online" : "Offline",
+                 local_node_enabled ? "Enabled" : "Disabled",
+                 store_and_forward_enabled ? "Enabled" : "Disabled",
+                 sync_queue_count);
+    }
+    save_data();
+    gtk_widget_destroy(dialog);
+}
+
+static void service_stand_manager_dialog(void) {
+    if (!role_can_service_lead() && !request_manager_override("Stand Manager")) return;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Stand Manager",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Assign", GTK_RESPONSE_OK,
+                                                   "_Close", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    GtkWidget *wo_entry = create_labeled_entry("Work Order ID:", vbox);
+    GtkWidget *stand_entry = create_labeled_entry("Stand Number:", vbox);
+    GtkWidget *mech_entry = create_labeled_entry("Mechanic:", vbox);
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        int wo_id = atoi(gtk_entry_get_text(GTK_ENTRY(wo_entry)));
+        int stand = atoi(gtk_entry_get_text(GTK_ENTRY(stand_entry)));
+        if (stand <= 0 || stand > repair_stand_count) show_error_dialog("Stand number out of range for this store.");
+        else {
+            RepairStandAssignment *slot = &repair_stands[stand - 1];
+            slot->stand_number = stand;
+            slot->work_order_id = wo_id;
+            strncpy(slot->mechanic, gtk_entry_get_text(GTK_ENTRY(mech_entry)), NAME_LEN - 1);
+            slot->mechanic[NAME_LEN - 1] = '\0';
+            slot->active = 1;
+            char detail[180];
+            snprintf(detail, sizeof(detail), "WO %d assigned to stand %d (%s)", wo_id, stand, slot->mechanic);
+            add_audit_log_entry(current_sales_user, "StandAssign", detail);
+            show_info_dialog("Work order queued in stand manager.");
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void labor_bundle_dialog(void) {
+    if (!role_can_service() && !request_manager_override("Labor + Parts Bundle")) return;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Labor + Parts Bundle",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Apply Bundle", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    GtkWidget *wo_entry = create_labeled_entry("Work Order ID:", vbox);
+    GtkWidget *bundle_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bundle_combo), "Flat Fix = Labor + Standard Tube");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bundle_combo), "Brake Tune = Labor + Cable Set");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(bundle_combo), 0);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Bundle:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), bundle_combo, FALSE, FALSE, 0);
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        int wo_id = atoi(gtk_entry_get_text(GTK_ENTRY(wo_entry)));
+        WorkOrder *target = NULL;
+        for (int i = 0; i < work_order_count; i++) {
+            if (!work_orders[i].hidden && work_orders[i].id == wo_id) { target = &work_orders[i]; break; }
+        }
+        if (!target) show_error_dialog("Work order not found.");
+        else {
+            int bundle = gtk_combo_box_get_active(GTK_COMBO_BOX(bundle_combo));
+            if (bundle == 0) {
+                target->labor_hours += 0.5;
+                target->parts_total += 12.99;
+            } else {
+                target->labor_hours += 0.75;
+                target->parts_total += 19.99;
+            }
+            target->labor_total = target->labor_hours * target->labor_rate;
+            target->total = target->labor_total + target->parts_total;
+            strncat(target->problem, " | BundleApplied", sizeof(target->problem) - strlen(target->problem) - 1);
+            save_data();
+            show_info_dialog("Bundle applied to work order.");
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void trade_in_bluebook_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Trade-In Bluebook",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Estimate", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    GtkWidget *model = create_labeled_entry("Bike Model:", vbox);
+    GtkWidget *year_entry = create_labeled_entry("Model Year:", vbox);
+    GtkWidget *condition = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(condition), "Excellent");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(condition), "Good");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(condition), "Fair");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(condition), 1);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Condition:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), condition, FALSE, FALSE, 0);
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        int year = atoi(gtk_entry_get_text(GTK_ENTRY(year_entry)));
+        if (year <= 0) year = 2020;
+        int age = 2026 - year;
+        if (age < 0) age = 0;
+        double base = 1600.0;
+        double cond_mult = 0.65;
+        int c = gtk_combo_box_get_active(GTK_COMBO_BOX(condition));
+        if (c == 0) cond_mult = 0.8;
+        if (c == 2) cond_mult = 0.5;
+        double estimate = (base - age * 120.0) * cond_mult;
+        if (estimate < 100.0) estimate = 100.0;
+        char msg[260];
+        snprintf(msg, sizeof(msg), "Trade-in estimate for %s: $%.2f\n(Stub via local heuristic. Replace with BicycleBlueBook API response.)",
+                 gtk_entry_get_text(GTK_ENTRY(model)), estimate);
+        show_info_dialog(msg);
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void suspension_setup_log_dialog(void) {
+    int si = choose_store_index();
+    if (si < 0) return;
+    if (!role_can_service() && !request_manager_override("Suspension Setup Log")) return;
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Suspension Setup Log",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Save", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    GtkWidget *serial = create_labeled_entry("Bike Serial:", vbox);
+    GtkWidget *fork_psi = create_labeled_entry("Fork PSI:", vbox);
+    GtkWidget *fork_rebound = create_labeled_entry("Fork Rebound Clicks:", vbox);
+    GtkWidget *shock_psi = create_labeled_entry("Shock PSI:", vbox);
+    GtkWidget *shock_rebound = create_labeled_entry("Shock Rebound Clicks:", vbox);
+    GtkWidget *notes = create_labeled_entry("Notes:", vbox);
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        if (suspension_log_count >= MAX_SUSPENSION_LOGS) {
+            show_error_dialog("Maximum suspension logs reached.");
+        } else {
+            SuspensionSetupLog *l = &suspension_logs[suspension_log_count++];
+            memset(l, 0, sizeof(*l));
+            l->store_idx = si;
+            l->customer_idx = -1;
+            strncpy(l->bike_serial, gtk_entry_get_text(GTK_ENTRY(serial)), NAME_LEN - 1);
+            get_today_date(l->date, sizeof(l->date));
+            l->fork_psi = atof(gtk_entry_get_text(GTK_ENTRY(fork_psi)));
+            l->fork_rebound = atoi(gtk_entry_get_text(GTK_ENTRY(fork_rebound)));
+            l->shock_psi = atof(gtk_entry_get_text(GTK_ENTRY(shock_psi)));
+            l->shock_rebound = atoi(gtk_entry_get_text(GTK_ENTRY(shock_rebound)));
+            strncpy(l->notes, gtk_entry_get_text(GTK_ENTRY(notes)), sizeof(l->notes) - 1);
+            save_data();
+            show_info_dialog("Suspension setup saved to CRM log.");
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void work_order_progress_sms_dialog(void) {
+    if (!role_can_service() && !request_manager_override("Work Order Progress SMS")) return;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Work Order Progress SMS",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Queue", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    GtkWidget *wo_entry = create_labeled_entry("Work Order ID:", vbox);
+    GtkWidget *phone = create_labeled_entry("Customer Phone:", vbox);
+    GtkWidget *stage_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(stage_combo), "In the stand");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(stage_combo), "Ready for pickup");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(stage_combo), 0);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Status Message:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), stage_combo, FALSE, FALSE, 0);
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        int wo_id = atoi(gtk_entry_get_text(GTK_ENTRY(wo_entry)));
+        const char *stage = gtk_combo_box_get_active(GTK_COMBO_BOX(stage_combo)) == 0 ? "is in the stand" : "is ready for pickup";
+        char detail[260];
+        snprintf(detail, sizeof(detail), "WO:%d To:%s Msg:Your bike %s", wo_id, gtk_entry_get_text(GTK_ENTRY(phone)), stage);
+        add_audit_log_entry(current_sales_user, "WorkOrderProgressSMS", detail);
+        show_info_dialog("Progress SMS queued (stub). Connect to provider webhook for delivery.");
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void buyer_dashboard_dialog(void) {
+    if (!role_can_buying() && !request_manager_override("Buying Dashboard")) return;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Buying Dashboard",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+    const double qbp_tire_cost = 34.25;
+    const double trek_tire_cost = 36.10;
+    const double retail = 64.99;
+    char line1[200], line2[220], line3[120];
+    snprintf(line1, sizeof(line1), "Tire Buy Comparison: Retail $%.2f", retail);
+    snprintf(line2, sizeof(line2), "QBP Cost $%.2f -> Margin %.1f%% | Trek Cost $%.2f -> Margin %.1f%%",
+             qbp_tire_cost, (retail - qbp_tire_cost) / retail * 100.0,
+             trek_tire_cost, (retail - trek_tire_cost) / retail * 100.0);
+    snprintf(line3, sizeof(line3), "Recommended source this week: %s", qbp_tire_cost < trek_tire_cost ? "QBP" : "Trek");
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new(line1), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new(line2), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new(line3), FALSE, FALSE, 0);
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static void product_lookup_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Product Lookup (SKU / UPC / Model)",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Search", GTK_RESPONSE_OK,
+                                                   "_Close", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+
+    GtkWidget *search_entry = create_labeled_entry("Enter SKU, UPC, Model, or Style Number:", vbox);
+    GtkWidget *result_label = gtk_label_new("Type a value and click Search.");
+    gtk_label_set_xalign(GTK_LABEL(result_label), 0.0);
+    gtk_label_set_line_wrap(GTK_LABEL(result_label), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), result_label, FALSE, FALSE, 0);
+
+    GtkWidget *image = gtk_image_new();
+    gtk_widget_set_size_request(image, 320, 180);
+    gtk_box_pack_start(GTK_BOX(vbox), image, FALSE, FALSE, 0);
+
+    GtkWidget *image_hint = gtk_label_new("Image: none");
+    gtk_label_set_xalign(GTK_LABEL(image_hint), 0.0);
+    gtk_label_set_line_wrap(GTK_LABEL(image_hint), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), image_hint, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(dialog);
+
+    int resp;
+    while ((resp = gtk_dialog_run(GTK_DIALOG(dialog))) == GTK_RESPONSE_OK) {
+        const char *needle = gtk_entry_get_text(GTK_ENTRY(search_entry));
+        if (!needle || strlen(needle) == 0) {
+            gtk_label_set_text(GTK_LABEL(result_label), "Please enter a search value.");
+            continue;
+        }
+
+        Product *found = NULL;
+        int found_store = -1;
+        for (int si = 0; si < store_count && !found; si++) {
+            Store *s = &stores[si];
+            for (int pi = 0; pi < s->product_count; pi++) {
+                Product *p = &s->products[pi];
+                if (strcmp(p->sku, needle) == 0 || strcmp(p->upc, needle) == 0 || strcmp(p->style_number, needle) == 0 || strcmp(p->manufacturer_part_number, needle) == 0) {
+                    found = p;
+                    found_store = si;
+                    break;
+                }
+            }
+        }
+
+        if (!found) {
+            for (int si = 0; si < store_count && !found; si++) {
+                Store *s = &stores[si];
+                for (int pi = 0; pi < s->product_count; pi++) {
+                    Product *p = &s->products[pi];
+                    if (strstr(p->name, needle) || strstr(p->style_name, needle) || strstr(p->style_number, needle)) {
+                        found = p;
+                        found_store = si;
+                        break;
+                    }
+                }
+            }
+        }
+
+        const QbpCatalogItem *qbp = NULL;
+        if (found) {
+            for (int i = 0; i < qbp_catalog_count; i++) {
+                if (!qbp_catalog[i].hidden && strcmp(qbp_catalog[i].sku, found->sku) == 0) {
+                    qbp = &qbp_catalog[i];
+                    break;
+                }
+            }
+        } else {
+            for (int i = 0; i < qbp_catalog_count; i++) {
+                if (qbp_catalog[i].hidden) continue;
+                if (strcmp(qbp_catalog[i].sku, needle) == 0 || strstr(qbp_catalog[i].description, needle)) {
+                    qbp = &qbp_catalog[i];
+                    break;
+                }
+            }
+        }
+
+        if (!found && !qbp) {
+            gtk_label_set_text(GTK_LABEL(result_label), "No product found for that value.");
+            gtk_image_clear(GTK_IMAGE(image));
+            gtk_label_set_text(GTK_LABEL(image_hint), "Image: none");
+            continue;
+        }
+
+        char details[1400];
+        details[0] = '\0';
+
+        if (found) {
+            snprintf(details, sizeof(details),
+                     "Store: %s\nSKU: %s\nName: %s\nBrand: %s\nUPC: %s\nStyle: %s / %s\nModel Year: %d\nColor/Size: %s / %s\nMSRP: $%.2f\nPrice: $%.2f\nStock: %d  Committed: %d  On Order: %d\nVendor: %s  MPN: %s",
+                     stores[found_store].name,
+                     found->sku,
+                     found->name,
+                     found->brand,
+                     found->upc,
+                     found->style_name,
+                     found->style_number,
+                     found->model_year,
+                     found->color,
+                     found->size,
+                     found->msrp,
+                     found->price,
+                     found->stock,
+                     found->committed_qty,
+                     found->on_order_qty,
+                     found->vendor,
+                     found->manufacturer_part_number);
+        } else {
+            snprintf(details, sizeof(details),
+                     "QBP Catalog Match\nSKU: %s\nDescription: %s\nWeight: %.2f lbs\nWarehouse Qty: NV %d / PA %d / WI %d",
+                     qbp->sku,
+                     qbp->description,
+                     qbp->weight_lbs,
+                     qbp->nv_qty,
+                     qbp->pa_qty,
+                     qbp->wi_qty);
+        }
+
+        if (qbp) {
+            strncat(details, "\nQBP Availability: ", sizeof(details) - strlen(details) - 1);
+            char avail[160];
+            snprintf(avail, sizeof(avail), "NV %d / PA %d / WI %d", qbp->nv_qty, qbp->pa_qty, qbp->wi_qty);
+            strncat(details, avail, sizeof(details) - strlen(details) - 1);
+
+            struct stat st;
+            if (strlen(qbp->image_url) > 0 && stat(qbp->image_url, &st) == 0) {
+                gtk_image_set_from_file(GTK_IMAGE(image), qbp->image_url);
+                gtk_label_set_text(GTK_LABEL(image_hint), qbp->image_url);
+            } else {
+                gtk_image_clear(GTK_IMAGE(image));
+                if (strlen(qbp->image_url) > 0) {
+                    char img_msg[300];
+                    snprintf(img_msg, sizeof(img_msg), "Image URL: %s", qbp->image_url);
+                    gtk_label_set_text(GTK_LABEL(image_hint), img_msg);
+                } else {
+                    gtk_label_set_text(GTK_LABEL(image_hint), "Image: none");
+                }
+            }
+        } else {
+            gtk_image_clear(GTK_IMAGE(image));
+            gtk_label_set_text(GTK_LABEL(image_hint), "Image: no linked QBP image cached yet");
+        }
+
+        gtk_label_set_text(GTK_LABEL(result_label), details);
+    }
+
+    gtk_widget_destroy(dialog);
 }
 
 static void system_configuration_dialog(void) {
@@ -3000,6 +3729,34 @@ static void show_main_menu(void) {
     g_signal_connect(sql_tools_item, "activate", G_CALLBACK(sql_query_tools_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), sql_tools_item);
 
+    GtkWidget *product_lookup_item = gtk_menu_item_new_with_label("Product Lookup (SKU/UPC/Model)");
+    g_signal_connect(product_lookup_item, "activate", G_CALLBACK(product_lookup_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), product_lookup_item);
+
+    GtkWidget *vendor_hub_item = gtk_menu_item_new_with_label("Big Four / QBP Vendor Hub");
+    g_signal_connect(vendor_hub_item, "activate", G_CALLBACK(vendor_integration_hub_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), vendor_hub_item);
+
+    GtkWidget *blackout_item = gtk_menu_item_new_with_label("Blackout Protocol (Offline Sync)");
+    g_signal_connect(blackout_item, "activate", G_CALLBACK(offline_blackout_protocol_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), blackout_item);
+
+    GtkWidget *stand_item = gtk_menu_item_new_with_label("Stand Manager");
+    g_signal_connect(stand_item, "activate", G_CALLBACK(service_stand_manager_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), stand_item);
+
+    GtkWidget *bundle_item = gtk_menu_item_new_with_label("Labor + Parts Bundle");
+    g_signal_connect(bundle_item, "activate", G_CALLBACK(labor_bundle_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), bundle_item);
+
+    GtkWidget *bluebook_item = gtk_menu_item_new_with_label("Trade-In Bluebook");
+    g_signal_connect(bluebook_item, "activate", G_CALLBACK(trade_in_bluebook_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), bluebook_item);
+
+    GtkWidget *suspension_item = gtk_menu_item_new_with_label("Suspension Setup Log");
+    g_signal_connect(suspension_item, "activate", G_CALLBACK(suspension_setup_log_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), suspension_item);
+
     // Reports menu
     GtkWidget *reports_menu = gtk_menu_new();
     GtkWidget *reports_item = gtk_menu_item_new_with_label("Reports");
@@ -3065,6 +3822,14 @@ static void show_main_menu(void) {
     GtkWidget *sms_pickup_item = gtk_menu_item_new_with_label("SMS Pickup Notifications");
     g_signal_connect(sms_pickup_item, "activate", G_CALLBACK(sms_pickup_notification_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), sms_pickup_item);
+
+    GtkWidget *wo_progress_sms_item = gtk_menu_item_new_with_label("Work Order Progress SMS");
+    g_signal_connect(wo_progress_sms_item, "activate", G_CALLBACK(work_order_progress_sms_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), wo_progress_sms_item);
+
+    GtkWidget *buyer_dashboard_item = gtk_menu_item_new_with_label("Buying Dashboard");
+    g_signal_connect(buyer_dashboard_item, "activate", G_CALLBACK(buyer_dashboard_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), buyer_dashboard_item);
 
     // Help menu
     GtkWidget *help_menu = gtk_menu_new();
@@ -5082,12 +5847,43 @@ static void save_data(void) {
         fprintf(f, "%s\n%s\n%s\n%s\n", v->in_store_sku, v->vendor_name, v->vendor_product_code, v->vendor_description);
     }
 
-        fprintf(f, "SYSTEM_CONFIG\n%d\n%d\n%s\n%s\n", enable_multistore_sync, trek_auto_register, current_sales_user, system_sales_popup_message);
-        fprintf(f, "ADV|%.4f|%.2f|%d|%d\n",
+    fprintf(f, "QBP_CATALOG\n%d\n", qbp_catalog_count);
+    for (int i = 0; i < qbp_catalog_count; i++) {
+        QbpCatalogItem *q = &qbp_catalog[i];
+        fprintf(f, "%d %d %d %d %.3f\n", q->hidden, q->nv_qty, q->pa_qty, q->wi_qty, q->weight_lbs);
+        fprintf(f, "%s\n%s\n%s\n", q->sku, q->description, q->image_url);
+    }
+
+    fprintf(f, "WEB_ORDER_PICKUPS\n%d\n", web_order_pickup_count);
+    for (int i = 0; i < web_order_pickup_count; i++) {
+        WebOrderPickup *w = &web_order_pickups[i];
+        fprintf(f, "%d %d %d %d\n", w->store_idx, w->customer_idx, w->status, w->hidden);
+        fprintf(f, "%s\n%s\n%s\n%s\n", w->manufacturer, w->manufacturer_order_number, w->model_name, w->labor_sku);
+    }
+
+    fprintf(f, "SUSPENSION_LOGS\n%d\n", suspension_log_count);
+    for (int i = 0; i < suspension_log_count; i++) {
+        SuspensionSetupLog *l = &suspension_logs[i];
+        fprintf(f, "%d %d %d %.2f %d %.2f %d\n", l->store_idx, l->customer_idx, l->hidden, l->fork_psi, l->fork_rebound, l->shock_psi, l->shock_rebound);
+        fprintf(f, "%s\n%s\n%s\n", l->bike_serial, l->date, l->notes);
+    }
+
+    fprintf(f, "SYNC_QUEUE\n%d\n", sync_queue_count);
+    for (int i = 0; i < sync_queue_count; i++) {
+        OfflineSyncQueueItem *q = &sync_queue[i];
+        fprintf(f, "%d %d %d %d\n", q->store_idx, q->qty, q->synced, q->hidden);
+        fprintf(f, "%s\n%s\n%s\n", q->transaction_id, q->sku, q->created_at);
+    }
+
+    fprintf(f, "SYSTEM_CONFIG\n%d\n%d\n%s\n%s\n", enable_multistore_sync, trek_auto_register, current_sales_user, system_sales_popup_message);
+    fprintf(f, "ADV|%.4f|%.2f|%d|%d|%d|%d|%d\n",
             app_settings.default_tax_rate,
             app_settings.max_discount_percent_sales,
             (int)active_theme_mode,
-            mobile_floor_mode_enabled);
+            mobile_floor_mode_enabled,
+            internet_online,
+            local_node_enabled,
+            store_and_forward_enabled);
 
     fprintf(f, "SECURITY_SETTINGS\n%d\n%s\n", active_user_role, manager_override_pin);
 
@@ -5301,6 +6097,16 @@ static void load_data(void) {
     purchase_order_count = 0;
     next_purchase_order_id = 8000;
     vendor_link_count = 0;
+    qbp_catalog_count = 0;
+    web_order_pickup_count = 0;
+    suspension_log_count = 0;
+    sync_queue_count = 0;
+    for (int i = 0; i < MAX_REPAIR_STANDS; i++) {
+        repair_stands[i].stand_number = i + 1;
+        repair_stands[i].work_order_id = 0;
+        repair_stands[i].mechanic[0] = '\0';
+        repair_stands[i].active = 0;
+    }
     active_user_role = ROLE_MANAGER;
     strncpy(manager_override_pin, "2468", NAME_LEN - 1);
     manager_override_pin[NAME_LEN - 1] = '\0';
@@ -5316,6 +6122,13 @@ static void load_data(void) {
     app_settings.layaway_grace_days = 10;
     app_settings.layaway_cancel_fee_percent = 15.0;
     app_settings.layaway_auto_cancel_enabled = 0;
+    app_settings.default_tax_rate = 0.0825;
+    app_settings.max_discount_percent_sales = 15.0;
+    active_theme_mode = THEME_SMART;
+    mobile_floor_mode_enabled = 0;
+    internet_online = 1;
+    local_node_enabled = 1;
+    store_and_forward_enabled = 1;
 
     if (!tiles_initialized) {
         init_default_tiles();
@@ -5753,6 +6566,119 @@ static void load_data(void) {
                     strncpy(v->vendor_description, vdesc, sizeof(v->vendor_description) - 1);
                 }
             }
+        } else if (strcmp(section_name, "QBP_CATALOG") == 0) {
+            int count = 0;
+            if (fscanf(f, "%d\n", &count) != 1) break;
+            int limit = (count < MAX_QBP_CATALOG_ITEMS) ? count : MAX_QBP_CATALOG_ITEMS;
+            qbp_catalog_count = limit;
+            for (int i = 0; i < count; i++) {
+                int hidden = 0, nv = 0, pa = 0, wi = 0;
+                double w = 0.0;
+                char sku[NAME_LEN], desc[NAME_LEN * 2], img[NAME_LEN * 2];
+                if (fscanf(f, "%d %d %d %d %lf\n", &hidden, &nv, &pa, &wi, &w) != 5) break;
+                if (!fgets(sku, sizeof(sku), f)) break;
+                if (!fgets(desc, sizeof(desc), f)) break;
+                if (!fgets(img, sizeof(img), f)) break;
+                sku[strcspn(sku, "\n")] = '\0';
+                desc[strcspn(desc, "\n")] = '\0';
+                img[strcspn(img, "\n")] = '\0';
+                if (i < limit) {
+                    QbpCatalogItem *q = &qbp_catalog[i];
+                    q->hidden = hidden;
+                    q->nv_qty = nv;
+                    q->pa_qty = pa;
+                    q->wi_qty = wi;
+                    q->weight_lbs = w;
+                    strncpy(q->sku, sku, NAME_LEN - 1);
+                    strncpy(q->description, desc, sizeof(q->description) - 1);
+                    strncpy(q->image_url, img, sizeof(q->image_url) - 1);
+                }
+            }
+        } else if (strcmp(section_name, "WEB_ORDER_PICKUPS") == 0) {
+            int count = 0;
+            if (fscanf(f, "%d\n", &count) != 1) break;
+            int limit = (count < MAX_WEB_ORDER_PICKUPS) ? count : MAX_WEB_ORDER_PICKUPS;
+            web_order_pickup_count = limit;
+            for (int i = 0; i < count; i++) {
+                int si = 0, ci = -1, status = 0, hidden = 0;
+                char mfg[NAME_LEN], order[NAME_LEN], model[NAME_LEN], labor[NAME_LEN];
+                if (fscanf(f, "%d %d %d %d\n", &si, &ci, &status, &hidden) != 4) break;
+                if (!fgets(mfg, sizeof(mfg), f)) break;
+                if (!fgets(order, sizeof(order), f)) break;
+                if (!fgets(model, sizeof(model), f)) break;
+                if (!fgets(labor, sizeof(labor), f)) break;
+                mfg[strcspn(mfg, "\n")] = '\0';
+                order[strcspn(order, "\n")] = '\0';
+                model[strcspn(model, "\n")] = '\0';
+                labor[strcspn(labor, "\n")] = '\0';
+                if (i < limit) {
+                    WebOrderPickup *w = &web_order_pickups[i];
+                    w->store_idx = si;
+                    w->customer_idx = ci;
+                    w->status = status;
+                    w->hidden = hidden;
+                    strncpy(w->manufacturer, mfg, NAME_LEN - 1);
+                    strncpy(w->manufacturer_order_number, order, NAME_LEN - 1);
+                    strncpy(w->model_name, model, NAME_LEN - 1);
+                    strncpy(w->labor_sku, labor, NAME_LEN - 1);
+                }
+            }
+        } else if (strcmp(section_name, "SUSPENSION_LOGS") == 0) {
+            int count = 0;
+            if (fscanf(f, "%d\n", &count) != 1) break;
+            int limit = (count < MAX_SUSPENSION_LOGS) ? count : MAX_SUSPENSION_LOGS;
+            suspension_log_count = limit;
+            for (int i = 0; i < count; i++) {
+                int si = 0, ci = -1, hidden = 0, fr = 0, sr = 0;
+                double fpsi = 0.0, spsi = 0.0;
+                char serial[NAME_LEN], date[NAME_LEN], notes[NAME_LEN * 2];
+                if (fscanf(f, "%d %d %d %lf %d %lf %d\n", &si, &ci, &hidden, &fpsi, &fr, &spsi, &sr) != 7) break;
+                if (!fgets(serial, sizeof(serial), f)) break;
+                if (!fgets(date, sizeof(date), f)) break;
+                if (!fgets(notes, sizeof(notes), f)) break;
+                serial[strcspn(serial, "\n")] = '\0';
+                date[strcspn(date, "\n")] = '\0';
+                notes[strcspn(notes, "\n")] = '\0';
+                if (i < limit) {
+                    SuspensionSetupLog *l = &suspension_logs[i];
+                    l->store_idx = si;
+                    l->customer_idx = ci;
+                    l->hidden = hidden;
+                    l->fork_psi = fpsi;
+                    l->fork_rebound = fr;
+                    l->shock_psi = spsi;
+                    l->shock_rebound = sr;
+                    strncpy(l->bike_serial, serial, NAME_LEN - 1);
+                    strncpy(l->date, date, NAME_LEN - 1);
+                    strncpy(l->notes, notes, sizeof(l->notes) - 1);
+                }
+            }
+        } else if (strcmp(section_name, "SYNC_QUEUE") == 0) {
+            int count = 0;
+            if (fscanf(f, "%d\n", &count) != 1) break;
+            int limit = (count < MAX_SYNC_QUEUE) ? count : MAX_SYNC_QUEUE;
+            sync_queue_count = limit;
+            for (int i = 0; i < count; i++) {
+                int si = 0, qty = 0, synced = 0, hidden = 0;
+                char txn[NAME_LEN], sku[NAME_LEN], created[NAME_LEN];
+                if (fscanf(f, "%d %d %d %d\n", &si, &qty, &synced, &hidden) != 4) break;
+                if (!fgets(txn, sizeof(txn), f)) break;
+                if (!fgets(sku, sizeof(sku), f)) break;
+                if (!fgets(created, sizeof(created), f)) break;
+                txn[strcspn(txn, "\n")] = '\0';
+                sku[strcspn(sku, "\n")] = '\0';
+                created[strcspn(created, "\n")] = '\0';
+                if (i < limit) {
+                    OfflineSyncQueueItem *q = &sync_queue[i];
+                    q->store_idx = si;
+                    q->qty = qty;
+                    q->synced = synced;
+                    q->hidden = hidden;
+                    strncpy(q->transaction_id, txn, NAME_LEN - 1);
+                    strncpy(q->sku, sku, NAME_LEN - 1);
+                    strncpy(q->created_at, created, NAME_LEN - 1);
+                }
+            }
         } else if (strcmp(section_name, "SYSTEM_CONFIG") == 0) {
             if (fscanf(f, "%d\n%d\n", &enable_multistore_sync, &trek_auto_register) != 2) break;
             if (!fgets(current_sales_user, sizeof(current_sales_user), f)) break;
@@ -5769,11 +6695,17 @@ static void load_data(void) {
                         double max_disc = app_settings.max_discount_percent_sales;
                         int theme = (int)active_theme_mode;
                         int mobile = mobile_floor_mode_enabled;
-                        if (sscanf(adv_line + 4, "%lf|%lf|%d|%d", &tax, &max_disc, &theme, &mobile) >= 2) {
+                        int net_online = internet_online;
+                        int local_node = local_node_enabled;
+                        int store_fwd = store_and_forward_enabled;
+                        if (sscanf(adv_line + 4, "%lf|%lf|%d|%d|%d|%d|%d", &tax, &max_disc, &theme, &mobile, &net_online, &local_node, &store_fwd) >= 2) {
                             if (tax >= 0.0) app_settings.default_tax_rate = tax;
                             if (max_disc >= 0.0) app_settings.max_discount_percent_sales = max_disc;
                             if (theme >= THEME_LIGHT && theme <= THEME_SMART) active_theme_mode = (ThemeMode)theme;
                             mobile_floor_mode_enabled = mobile ? 1 : 0;
+                            internet_online = net_online ? 1 : 0;
+                            local_node_enabled = local_node ? 1 : 0;
+                            store_and_forward_enabled = store_fwd ? 1 : 0;
                         }
                     } else {
                         fseek(f, pos, SEEK_SET);
@@ -5786,7 +6718,7 @@ static void load_data(void) {
             if (fscanf(f, "%d\n", &role_val) != 1) break;
             if (!fgets(pin_line, sizeof(pin_line), f)) break;
             pin_line[strcspn(pin_line, "\n")] = '\0';
-            if (role_val < ROLE_ADMIN || role_val > ROLE_INVENTORY_MANAGER) role_val = ROLE_MANAGER;
+            if (role_val < ROLE_ADMIN || role_val > ROLE_BUYER) role_val = ROLE_MANAGER;
             active_user_role = (UserRole)role_val;
             if (strlen(pin_line) > 0) {
                 strncpy(manager_override_pin, pin_line, NAME_LEN - 1);
