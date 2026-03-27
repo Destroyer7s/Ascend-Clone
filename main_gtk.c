@@ -512,7 +512,7 @@ static int repair_stand_count = 8; // configured stand count for this deployment
 
 static UserRole active_user_role = ROLE_MANAGER; // currently active permission role
 static char manager_override_pin[NAME_LEN] = "2468"; // override PIN for restricted actions
-static AppSettings app_settings = {1, 1, 7, 10, 15.0, 0, 0.0825, 15.0, "Ubuntu", 12, "#2E86C1", "#1F618D", "#FFFFFF"}; // app policy/config values
+static AppSettings app_settings = {1, 1, 7, 10, 15.0, 0, 0.0825, 15.0, "Ubuntu", 12, "#2E86C1", "#1F618D", "#111827"}; // app policy/config values
 static char system_sales_popup_message[NAME_LEN * 3] = "Verify info for registration."; // sales popup template
 static char current_sales_user[NAME_LEN] = "Ascend User"; // default logged-in operator name
 static int enable_multistore_sync = 1; // multi-store sync toggle
@@ -1860,7 +1860,7 @@ static void apply_visual_theme(ThemeMode mode) {
     const int dark = should_use_dark_mode(mode);
     const char *css_light =
         "* { font-family: 'Inter', 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; font-size: 13px; }"
-        "window { background-color: #F0F4F8; color: #1A202C; }"
+        "window { background-color: #ECF2F7; color: #111827; }"
         "menubar { background-image: linear-gradient(to bottom, #1A3A5C, #102A48); color: white; padding: 2px 0; border-bottom: 2px solid #0A1F36; }"
         "menubar > menuitem { color: white; padding: 6px 14px; }"
         "menubar > menuitem:hover, menubar > menuitem:selected { background-color: rgba(255,255,255,0.18); }"
@@ -1876,24 +1876,24 @@ static void apply_visual_theme(ThemeMode mode) {
         "button.suggested-action:hover { background-image: linear-gradient(to bottom, #48BB78, #38A169); }"
         "button.destructive-action { background-image: linear-gradient(to bottom, #E53E3E, #C53030); color: white; }"
         "button.destructive-action:hover { background-image: linear-gradient(to bottom, #FC5858, #E53E3E); }"
-        "entry { background-color: white; color: #1A202C; border: 1.5px solid #BDC6CF; border-radius: 7px; padding: 7px 12px; }"
+        "entry { background-color: white; color: #0F172A; border: 1.5px solid #94A3B8; border-radius: 7px; padding: 7px 12px; }"
         "entry:focus { border-color: #4A9EE7; background-color: white; }"
         "entry:disabled { background-color: #EDF2F7; color: #A0AEC0; }"
-        "combobox button { background-image: linear-gradient(to bottom, #FFFFFF, #EDF2F7); color: #1A202C; border: 1.5px solid #BDC6CF; border-radius: 7px; padding: 6px 10px; font-weight: normal; }"
+        "combobox button { background-image: linear-gradient(to bottom, #FFFFFF, #EDF2F7); color: #0F172A; border: 1.5px solid #94A3B8; border-radius: 7px; padding: 6px 10px; font-weight: normal; }"
         "combobox button:hover { background-image: linear-gradient(to bottom, #EBF4FF, #DBEAFE); }"
         "scrollbar { background-color: transparent; border: none; padding: 0; }"
         "scrollbar.vertical { min-width: 10px; }"
         "scrollbar.horizontal { min-height: 10px; }"
         "scrollbar slider { background-color: #A8BAC9; border-radius: 5px; min-width: 6px; min-height: 6px; border: 2px solid transparent; }"
         "scrollbar slider:hover { background-color: #718096; }"
-        ".view { background-color: white; color: #1A202C; }"
+        ".view { background-color: white; color: #111827; }"
         "treeview.view { border: 1px solid #D0D8E0; }"
         "treeview.view:selected { background-color: #2B6CB0; color: white; }"
         "treeview header button { background-image: linear-gradient(to bottom, #F7FAFC, #EDF2F7); color: #4A5568; border-bottom: 2px solid #CBD5E0; font-weight: 700; padding: 8px 12px; }"
         "treeview header button:hover { background-image: linear-gradient(to bottom, #EBF8FF, #DBEAFE); }"
         "checkbutton check, radiobutton radio { background-color: white; border: 1.5px solid #BDC6CF; border-radius: 4px; }"
         "checkbutton check:checked, radiobutton radio:checked { background-color: #2B6CB0; border-color: #2B6CB0; }"
-        "label { color: #1A202C; }"
+        "label { color: #111827; }"
         ".heading { font-weight: 700; font-size: 14px; }"
         ".warning { color: #B7770D; font-weight: 700; }"
         ".danger, .balance-due { color: #C53030; font-weight: 700; }"
@@ -1906,8 +1906,12 @@ static void apply_visual_theme(ThemeMode mode) {
         "#role-badge { background-color: rgba(255,255,255,0.18); color: white; border-radius: 10px; padding: 3px 10px; font-size: 11px; font-weight: 700; }"
         "#app-status { background-color: #1A2530; border-top: 1px solid #0A1520; }"
         "#app-status label { color: #8899AA; font-size: 11px; }"
-        "dialog { background-color: #F7FAFC; }"
-        ".dialog-action-area { background-color: #EDF2F7; border-top: 1px solid #CBD5E0; padding: 8px 10px; }"
+        "dialog, .dialog-vbox, .message-dialog, .message-dialog box { background-color: #FFFFFF; color: #111827; }"
+        "dialog label, .message-dialog label, dialog checkbutton label, dialog radiobutton label { color: #111827; }"
+        "dialog entry, dialog textview text, .message-dialog entry { color: #0F172A; }"
+        "dialog textview text { background-color: #FFFFFF; }"
+        ".dialog-action-area { background-color: #E7EEF5; border-top: 1px solid #B8C6D5; padding: 8px 10px; }"
+        "tooltip { background-color: #0F172A; color: #F8FAFC; border: 1px solid #0B1220; }"
         "notebook tab { background-color: #E2E8F0; color: #718096; padding: 7px 16px; border-radius: 6px 6px 0 0; }"
         "notebook tab:checked { background-color: white; color: #1A202C; font-weight: 600; }"
         "progressbar trough { background-color: #CBD5E0; border-radius: 5px; min-height: 8px; }"
@@ -1976,8 +1980,12 @@ static void apply_visual_theme(ThemeMode mode) {
         "#app-status { background-color: #0A0E14; border-top: 1px solid #04070C; }"
         "#app-status label { color: #4A5A6A; font-size: 11px; }"
         /* Dialogs */
-        "dialog { background-color: #141820; }"
+        "dialog, .dialog-vbox, .message-dialog, .message-dialog box { background-color: #141820; color: #E2E4EA; }"
+        "dialog label, .message-dialog label, dialog checkbutton label, dialog radiobutton label { color: #E2E4EA; }"
+        "dialog entry, dialog textview text, .message-dialog entry { color: #E2E4EA; }"
+        "dialog textview text { background-color: #111827; }"
         ".dialog-action-area { background-color: #0F1318; border-top: 1px solid #1A2030; padding: 8px 10px; }"
+        "tooltip { background-color: #0A0E14; color: #E2E8F0; border: 1px solid #1F2937; }"
         /* Notebook */
         "notebook tab { background-color: #1A2030; color: #7A8898; padding: 7px 16px; border-radius: 6px 6px 0 0; }"
         "notebook tab:checked { background-color: #1E2638; color: #E2E4EA; font-weight: 600; }"
@@ -4008,6 +4016,17 @@ static void font_and_color_picker_dialog(void) {
     gtk_box_pack_start(GTK_BOX(content), color_label, FALSE, FALSE, 5);
     gtk_box_pack_start(GTK_BOX(content), color_grid, FALSE, FALSE, 5);
 
+    GdkRGBA initial;
+    if (gdk_rgba_parse(&initial, app_settings.color_accent_light)) {
+        gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(primary_color_btn), &initial);
+    }
+    if (gdk_rgba_parse(&initial, app_settings.color_accent_dark)) {
+        gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(secondary_color_btn), &initial);
+    }
+    if (gdk_rgba_parse(&initial, app_settings.color_text_light)) {
+        gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(text_color_btn), &initial);
+    }
+
     gtk_widget_show_all(content);
 
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
@@ -4037,6 +4056,13 @@ static void font_and_color_picker_dialog(void) {
         gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(text_color_btn), &color);
         snprintf(app_settings.color_text_light, NAME_LEN, "#%02X%02X%02X",
                  (int)(color.red * 255), (int)(color.green * 255), (int)(color.blue * 255));
+
+        if (strlen(app_settings.color_text_light) == 0 || g_ascii_strcasecmp(app_settings.color_text_light, "#FFFFFF") == 0) {
+            strncpy(app_settings.color_text_light, "#111827", NAME_LEN - 1);
+            app_settings.color_text_light[NAME_LEN - 1] = '\0';
+        }
+
+        apply_visual_theme(active_theme_mode);
 
         save_data();
         GtkWidget *msg = gtk_message_dialog_new(
