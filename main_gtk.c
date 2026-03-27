@@ -3096,6 +3096,32 @@ static void buyer_dashboard_dialog(void) {
  * - Attempts local image file preview; otherwise shows URL reference text.
  */
 static void product_lookup_dialog(void) {
+    /* First: ask which site to search */
+    GtkWidget *site_dialog = gtk_dialog_new_with_buttons("Select Search Source",
+                                                         GTK_WINDOW(main_window),
+                                                         GTK_DIALOG_MODAL,
+                                                         "Trek", 1,
+                                                         "Giant", 2,
+                                                         "QBP", 3,
+                                                         "Bike World", 4,
+                                                         "_Cancel", GTK_RESPONSE_CANCEL,
+                                                         NULL);
+    gtk_window_set_default_size(GTK_WINDOW(site_dialog), 300, 150);
+    GtkWidget *site_area = gtk_dialog_get_content_area(GTK_DIALOG(site_dialog));
+    GtkWidget *site_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(site_vbox), 15);
+    gtk_container_add(GTK_CONTAINER(site_area), site_vbox);
+
+    GtkWidget *site_label = gtk_label_new("Choose which source to search:");
+    gtk_box_pack_start(GTK_BOX(site_vbox), site_label, FALSE, FALSE, 0);
+    gtk_widget_show_all(site_dialog);
+
+    gint site_choice = gtk_dialog_run(GTK_DIALOG(site_dialog));
+    gtk_widget_destroy(site_dialog);
+
+    if (site_choice == GTK_RESPONSE_CANCEL) return;
+
+    /* Now create the search dialog based on site selection */
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Product Lookup (SKU / UPC / Model)",
                                                    GTK_WINDOW(main_window),
                                                    GTK_DIALOG_MODAL,
@@ -3106,6 +3132,18 @@ static void product_lookup_dialog(void) {
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
     gtk_container_add(GTK_CONTAINER(area), vbox);
+
+    char source_label[256];
+    switch (site_choice) {
+        case 1: snprintf(source_label, sizeof(source_label), "Trek Inventory"); break;
+        case 2: snprintf(source_label, sizeof(source_label), "Giant Inventory"); break;
+        case 3: snprintf(source_label, sizeof(source_label), "QBP Catalog"); break;
+        case 4: snprintf(source_label, sizeof(source_label), "Bike World Catalog"); break;
+        default: return;
+    }
+
+    GtkWidget *source_display = gtk_label_new(source_label);
+    gtk_box_pack_start(GTK_BOX(vbox), source_display, FALSE, FALSE, 0);
 
     GtkWidget *search_entry = create_labeled_entry("Enter SKU, UPC, Model, or Style Number:", vbox);
     GtkWidget *result_label = gtk_label_new("Type a value and click Search.");
@@ -3132,46 +3170,33 @@ static void product_lookup_dialog(void) {
             continue;
         }
 
-        /* First pass: exact identifier match for precision lookups (scanner-friendly). */
         Product *found = NULL;
         int found_store = -1;
-        for (int si = 0; si < store_count && !found; si++) {
-            Store *s = &stores[si];
-            for (int pi = 0; pi < s->product_count; pi++) {
-                Product *p = &s->products[pi];
-                if (strcmp(p->sku, needle) == 0 || strcmp(p->upc, needle) == 0 || strcmp(p->style_number, needle) == 0 || strcmp(p->manufacturer_part_number, needle) == 0) {
-                    found = p;
-                    found_store = si;
-                    break;
-                }
-            }
-        }
+        const QbpCatalogItem *qbp = NULL;
+        const ScannedProduct *scanned = NULL;
 
-        /* Second pass: partial text search for manual/fuzzy operator input. */
-        if (!found) {
+        /* Search based on selected site */
+        if (site_choice == 1 || site_choice == 2) {
+            /* Trek or Giant: search local stores by brand */
+            const char *target_brand = (site_choice == 1) ? "Trek" : "Giant";
             for (int si = 0; si < store_count && !found; si++) {
                 Store *s = &stores[si];
                 for (int pi = 0; pi < s->product_count; pi++) {
                     Product *p = &s->products[pi];
-                    if (strstr(p->name, needle) || strstr(p->style_name, needle) || strstr(p->style_number, needle)) {
-                        found = p;
-                        found_store = si;
-                        break;
+                    /* Match by brand and search term */
+                    if (strcmp(p->brand, target_brand) == 0) {
+                        if (strcmp(p->sku, needle) == 0 || strcmp(p->upc, needle) == 0 || 
+                            strcmp(p->style_number, needle) == 0 || strcmp(p->manufacturer_part_number, needle) == 0 ||
+                            strstr(p->name, needle) || strstr(p->style_name, needle) || strstr(p->style_number, needle)) {
+                            found = p;
+                            found_store = si;
+                            break;
+                        }
                     }
                 }
             }
-        }
-
-        /* Optional enrichment pass: attach QBP metadata/image/warehouse quantities. */
-        const QbpCatalogItem *qbp = NULL;
-        if (found) {
-            for (int i = 0; i < qbp_catalog_count; i++) {
-                if (!qbp_catalog[i].hidden && strcmp(qbp_catalog[i].sku, found->sku) == 0) {
-                    qbp = &qbp_catalog[i];
-                    break;
-                }
-            }
-        } else {
+        } else if (site_choice == 3) {
+            /* QBP: search QBP catalog */
             for (int i = 0; i < qbp_catalog_count; i++) {
                 if (qbp_catalog[i].hidden) continue;
                 if (strcmp(qbp_catalog[i].sku, needle) == 0 || strstr(qbp_catalog[i].description, needle)) {
@@ -3179,10 +3204,20 @@ static void product_lookup_dialog(void) {
                     break;
                 }
             }
+        } else if (site_choice == 4) {
+            /* Bike World: search scanned products */
+            for (int i = 0; i < scanned_product_count; i++) {
+                if (strcmp(scanned_products[i].sku, needle) == 0 || strcmp(scanned_products[i].upc, needle) == 0 ||
+                    strcmp(scanned_products[i].manufacturer_part_number, needle) == 0 ||
+                    strstr(scanned_products[i].name, needle) || strstr(scanned_products[i].category, needle)) {
+                    scanned = &scanned_products[i];
+                    break;
+                }
+            }
         }
 
-        if (!found && !qbp) {
-            gtk_label_set_text(GTK_LABEL(result_label), "No product found for that value.");
+        if (!found && !qbp && !scanned) {
+            gtk_label_set_text(GTK_LABEL(result_label), "No product found for that value in selected source.");
             gtk_image_clear(GTK_IMAGE(image));
             gtk_label_set_text(GTK_LABEL(image_hint), "Image: none");
             continue;
@@ -3211,7 +3246,7 @@ static void product_lookup_dialog(void) {
                      found->on_order_qty,
                      found->vendor,
                      found->manufacturer_part_number);
-        } else {
+        } else if (qbp) {
             snprintf(details, sizeof(details),
                      "QBP Catalog Match\nSKU: %s\nDescription: %s\nWeight: %.2f lbs\nWarehouse Qty: NV %d / PA %d / WI %d",
                      qbp->sku,
@@ -3220,13 +3255,6 @@ static void product_lookup_dialog(void) {
                      qbp->nv_qty,
                      qbp->pa_qty,
                      qbp->wi_qty);
-        }
-
-        if (qbp) {
-            strncat(details, "\nQBP Availability: ", sizeof(details) - strlen(details) - 1);
-            char avail[160];
-            snprintf(avail, sizeof(avail), "NV %d / PA %d / WI %d", qbp->nv_qty, qbp->pa_qty, qbp->wi_qty);
-            strncat(details, avail, sizeof(details) - strlen(details) - 1);
 
             struct stat st;
             if (strlen(qbp->image_url) > 0 && stat(qbp->image_url, &st) == 0) {
@@ -3242,9 +3270,21 @@ static void product_lookup_dialog(void) {
                     gtk_label_set_text(GTK_LABEL(image_hint), "Image: none");
                 }
             }
-        } else {
+        } else if (scanned) {
+            snprintf(details, sizeof(details),
+                     "Bike World Product\nSKU: %s\nName: %s\nCategory: %s\nVendor: %s\nPrice: $%.2f\nUPC: %s\nMPN: %s\nStock: %s\nLast Scanned: %s\nURL: %s",
+                     scanned->sku,
+                     scanned->name,
+                     scanned->category,
+                     scanned->vendor,
+                     scanned->price,
+                     scanned->upc,
+                     scanned->manufacturer_part_number,
+                     scanned->in_stock ? "In Stock" : "Out of Stock",
+                     scanned->last_scanned,
+                     scanned->url);
             gtk_image_clear(GTK_IMAGE(image));
-            gtk_label_set_text(GTK_LABEL(image_hint), "Image: no linked QBP image cached yet");
+            gtk_label_set_text(GTK_LABEL(image_hint), "Image: none");
         }
 
         gtk_label_set_text(GTK_LABEL(result_label), details);
