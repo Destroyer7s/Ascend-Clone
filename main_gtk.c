@@ -10,6 +10,8 @@
 #define MAX_CUSTOMERS 200
 #define MAX_TRANSACTIONS 500
 #define MAX_SPECIAL_ORDERS 200
+#define MAX_TAX_EXCEPTIONS 200
+#define MAX_TIME_CLOCK_ENTRIES 2000
 #define NAME_LEN 64
 #define MAX_DAYS 30
 
@@ -119,6 +121,8 @@ typedef struct {
     char notes[NAME_LEN * 2];
     char date[NAME_LEN]; // YYYY-MM-DD format or empty
     int print_receipt; // 1=yes, 0=no
+    int is_return; // 1 if this is a return transaction
+    char original_transaction_id[NAME_LEN]; // original sale's ID for returns
 } Transaction;
 
 typedef struct {
@@ -130,6 +134,20 @@ typedef struct {
     int post_purchase_email_enabled;
     char post_purchase_message[NAME_LEN * 2];
 } TrekMarketingSettings;
+
+typedef struct {
+    char description[NAME_LEN * 2];
+    int requires_tax_id;
+    int hidden;
+} TaxExceptionReason;
+
+typedef struct {
+    char user_name[NAME_LEN];
+    char start_time[NAME_LEN]; // YYYY-MM-DD HH:MM
+    int has_end_time;
+    char end_time[NAME_LEN]; // YYYY-MM-DD HH:MM
+    int hidden;
+} TimeClockEntry;
 
 typedef struct {
     char name[NAME_LEN];
@@ -154,6 +172,10 @@ typedef struct {
 
 static Store stores[MAX_STORES];
 static int store_count = 0;
+static TaxExceptionReason tax_exceptions[MAX_TAX_EXCEPTIONS];
+static int tax_exception_count = 0;
+static TimeClockEntry time_clock_entries[MAX_TIME_CLOCK_ENTRIES];
+static int time_clock_count = 0;
 static GtkWidget *main_window;
 static GtkWidget *status_label;
 
@@ -162,7 +184,7 @@ static GtkWidget *status_label;
 #define TILE_SIZE_WIDE 212
 #define TILE_SIZE_LARGE 212
 
-typedef enum { TILE_ADD_STORE, TILE_LIST_STORES, TILE_STORE_INFO, TILE_INVENTORY, TILE_CUSTOMERS, TILE_SALES, TILE_LAYAWAY, TILE_BUSINESS, TILE_TREND, TILE_SAVE, TILE_LOAD, TILE_EXIT } TileType;
+typedef enum { TILE_ADD_STORE, TILE_LIST_STORES, TILE_STORE_INFO, TILE_INVENTORY, TILE_CUSTOMERS, TILE_SALES, TILE_RETURN, TILE_LAYAWAY, TILE_BUSINESS, TILE_TREND, TILE_SAVE, TILE_LOAD, TILE_EXIT } TileType;
 typedef enum { SIZE_SMALL, SIZE_WIDE, SIZE_LARGE } TileSize;
 typedef enum { COLOR_LIGHT_BLUE, COLOR_DARK_BLUE, COLOR_GREEN, COLOR_ORANGE, COLOR_SLATE } TileColor;
 
@@ -199,6 +221,18 @@ static void list_customers_dialog(Store *s);
 static void create_sale_dialog(void);
 static void create_layaway_dialog(void);
 static void complete_sale_dialog(void);
+static void create_return_dialog(void);
+static void customer_tax_exceptions_dialog(void);
+static void on_add_tax_exception_clicked(GtkToolButton *button, gpointer data);
+static void time_clock_dialog(void);
+static void on_add_time_clock_clicked(GtkToolButton *button, gpointer data);
+static void on_edit_time_clock_clicked(GtkToolButton *button, gpointer data);
+static void on_remove_time_clock_clicked(GtkToolButton *button, gpointer data);
+static void on_restore_time_clock_clicked(GtkToolButton *button, gpointer data);
+static void on_refresh_time_clock_clicked(GtkButton *button, gpointer data);
+static void time_clock_report_dialog(void);
+static void refresh_time_clock_report(GtkWidget *dialog);
+static void on_refresh_time_clock_report_clicked(GtkButton *button, gpointer data);
 static void special_order_prompt_dialog(Store *s, const char *sku, int qty, int *is_special_order, char *comments);
 static void reorder_list_dialog(void);
 static void special_orders_on_order_report(void);
@@ -416,7 +450,7 @@ static gboolean on_desktop_button_release(GtkWidget *widget, GdkEventButton *eve
 }
 
 static void init_default_tiles(void) {
-    tile_count = 12;
+    tile_count = 13;
     int x = 20, y = 80;
 
     tiles[0] = (Tile){ TILE_ADD_STORE, "Add Store", x, y, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_LIGHT_BLUE, 1 };
@@ -425,6 +459,7 @@ static void init_default_tiles(void) {
     tiles[3] = (Tile){ TILE_INVENTORY, "Inventory", x, y + 120, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_GREEN, 1 };
     tiles[4] = (Tile){ TILE_CUSTOMERS, "Customers", x + 120, y + 120, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_DARK_BLUE, 1 };
     tiles[5] = (Tile){ TILE_SALES, "Sales", x + 240, y + 120, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_ORANGE, 1 };
+        tiles[12] = (Tile){ TILE_RETURN, "Return", x + 360, y + 120, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_ORANGE, 1 };
     tiles[6] = (Tile){ TILE_LAYAWAY, "Layaway", x, y + 240, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_ORANGE, 1 };
     tiles[7] = (Tile){ TILE_BUSINESS, "Business", x + 120, y + 240, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_ORANGE, 1 };
     tiles[8] = (Tile){ TILE_TREND, "Trend Chart", x + 240, y + 240, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_DARK_BLUE, 1 };
@@ -442,6 +477,7 @@ static void execute_tile_action(TileType type) {
         case TILE_CUSTOMERS: manage_customers_dialog(); break;
         case TILE_SALES: create_sale_dialog(); break;
         case TILE_LAYAWAY: create_layaway_dialog(); break;
+            case TILE_RETURN: create_return_dialog(); break;
         case TILE_BUSINESS: business_menu_dialog(); break;
         case TILE_TREND: show_trend_dialog(); break;
         case TILE_SAVE: save_data(); break;
@@ -525,6 +561,24 @@ static void show_main_menu(void) {
     g_signal_connect(layaways_item, "activate", G_CALLBACK(view_layaways_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), layaways_item);
 
+    GtkWidget *tax_exceptions_item = gtk_menu_item_new_with_label("Customer Tax Exceptions");
+    g_signal_connect(tax_exceptions_item, "activate", G_CALLBACK(customer_tax_exceptions_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), tax_exceptions_item);
+
+    GtkWidget *time_clock_item = gtk_menu_item_new_with_label("Time Clock");
+    g_signal_connect(time_clock_item, "activate", G_CALLBACK(time_clock_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), time_clock_item);
+
+    // Sales menu
+    GtkWidget *sales_menu = gtk_menu_new();
+    GtkWidget *sales_item = gtk_menu_item_new_with_label("Sales");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(sales_item), sales_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), sales_item);
+
+    GtkWidget *return_item = gtk_menu_item_new_with_label("Create a Return");
+    g_signal_connect(return_item, "activate", G_CALLBACK(create_return_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(sales_menu), return_item);
+
     GtkWidget *special_orders_item = gtk_menu_item_new_with_label("Special Ordered Items");
     g_signal_connect(special_orders_item, "activate", G_CALLBACK(view_special_orders_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), special_orders_item);
@@ -550,6 +604,10 @@ static void show_main_menu(void) {
     GtkWidget *so_received_item = gtk_menu_item_new_with_label("Special Order Items Received");
     g_signal_connect(so_received_item, "activate", G_CALLBACK(special_orders_received_report), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), so_received_item);
+
+    GtkWidget *time_clock_report_item = gtk_menu_item_new_with_label("Time Clock");
+    g_signal_connect(time_clock_report_item, "activate", G_CALLBACK(time_clock_report_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), time_clock_report_item);
 
     // Title bar
     GtkWidget *title_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
@@ -581,6 +639,530 @@ static void show_main_menu(void) {
     gtk_box_pack_start(GTK_BOX(status_box), status_label, FALSE, FALSE, 10);
 
     gtk_widget_show_all(main_window);
+}
+
+static void on_add_tax_exception_clicked(GtkToolButton *button, gpointer data) {
+    (void)button;
+
+    GtkWidget *parent_dialog = GTK_WIDGET(data);
+    GtkListStore *store_list = GTK_LIST_STORE(g_object_get_data(G_OBJECT(parent_dialog), "tax_exception_store"));
+    if (!store_list) return;
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Add Tax Exception Reason",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Save", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *description_entry = create_labeled_entry("Description:", vbox);
+
+    GtkWidget *requires_tax_id = gtk_check_button_new_with_label("Requires Tax ID");
+    gtk_box_pack_start(GTK_BOX(vbox), requires_tax_id, FALSE, FALSE, 0);
+
+    GtkWidget *hidden = gtk_check_button_new_with_label("Hidden");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(hidden), FALSE);
+    gtk_box_pack_start(GTK_BOX(vbox), hidden, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char *desc = gtk_entry_get_text(GTK_ENTRY(description_entry));
+        int req_tax_id = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(requires_tax_id));
+        int is_hidden = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(hidden));
+
+        if (strlen(desc) == 0) {
+            show_error_dialog("Description is required.");
+        } else if (tax_exception_count >= MAX_TAX_EXCEPTIONS) {
+            show_error_dialog("Maximum tax exception reasons reached.");
+        } else {
+            TaxExceptionReason *r = &tax_exceptions[tax_exception_count++];
+            strncpy(r->description, desc, sizeof(r->description) - 1);
+            r->description[sizeof(r->description) - 1] = '\0';
+            r->requires_tax_id = req_tax_id;
+            r->hidden = is_hidden;
+
+            GtkTreeIter iter;
+            gtk_list_store_append(store_list, &iter);
+            gtk_list_store_set(store_list, &iter,
+                              0, r->description,
+                              1, r->requires_tax_id ? "Yes" : "No",
+                              2, r->hidden ? "Yes" : "No",
+                              -1);
+
+            save_data();
+            show_info_dialog("Tax exception reason saved.");
+        }
+    }
+
+    gtk_widget_destroy(dialog);
+}
+
+static void customer_tax_exceptions_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Customer Tax Exceptions",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *toolbar = gtk_toolbar_new();
+    gtk_toolbar_set_style(GTK_TOOLBAR(toolbar), GTK_TOOLBAR_BOTH);
+    GtkToolItem *add_item = gtk_tool_button_new(NULL, "Add");
+    gtk_tool_button_set_icon_name(GTK_TOOL_BUTTON(add_item), "list-add");
+    gtk_toolbar_insert(GTK_TOOLBAR(toolbar), add_item, -1);
+    gtk_box_pack_start(GTK_BOX(vbox), toolbar, FALSE, FALSE, 0);
+
+    GtkWidget *list_sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(list_sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(list_sw, 560, 260);
+    gtk_box_pack_start(GTK_BOX(vbox), list_sw, TRUE, TRUE, 0);
+
+    GtkListStore *store_list = gtk_list_store_new(3,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_STRING);
+
+    for (int i = 0; i < tax_exception_count; i++) {
+        TaxExceptionReason *r = &tax_exceptions[i];
+        GtkTreeIter iter;
+        gtk_list_store_append(store_list, &iter);
+        gtk_list_store_set(store_list, &iter,
+                          0, r->description,
+                          1, r->requires_tax_id ? "Yes" : "No",
+                          2, r->hidden ? "Yes" : "No",
+                          -1);
+    }
+
+    GtkTreeView *tree = GTK_TREE_VIEW(gtk_tree_view_new_with_model(GTK_TREE_MODEL(store_list)));
+    GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "Description", renderer, "text", 0, NULL);
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "Requires Tax ID", renderer, "text", 1, NULL);
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "Hidden", renderer, "text", 2, NULL);
+    gtk_container_add(GTK_CONTAINER(list_sw), GTK_WIDGET(tree));
+
+    g_object_set_data(G_OBJECT(dialog), "tax_exception_store", store_list);
+    g_signal_connect(add_item, "clicked", G_CALLBACK(on_add_tax_exception_clicked), dialog);
+
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static void get_today_date(char *out, size_t out_size) {
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    strftime(out, out_size, "%Y-%m-%d", tm_info);
+}
+
+static int parse_datetime_str(const char *value, struct tm *out_tm) {
+    int year, month, day, hour, minute;
+    if (sscanf(value, "%d-%d-%d %d:%d", &year, &month, &day, &hour, &minute) != 5) {
+        return 0;
+    }
+    memset(out_tm, 0, sizeof(struct tm));
+    out_tm->tm_year = year - 1900;
+    out_tm->tm_mon = month - 1;
+    out_tm->tm_mday = day;
+    out_tm->tm_hour = hour;
+    out_tm->tm_min = minute;
+    out_tm->tm_isdst = -1;
+    return 1;
+}
+
+static double compute_time_clock_hours(const TimeClockEntry *entry) {
+    if (!entry->has_end_time) return 0.0;
+
+    struct tm start_tm, end_tm;
+    if (!parse_datetime_str(entry->start_time, &start_tm) || !parse_datetime_str(entry->end_time, &end_tm)) {
+        return 0.0;
+    }
+
+    time_t start_ts = mktime(&start_tm);
+    time_t end_ts = mktime(&end_tm);
+    if (start_ts == (time_t)-1 || end_ts == (time_t)-1 || end_ts < start_ts) {
+        return 0.0;
+    }
+
+    double seconds = difftime(end_ts, start_ts);
+    return seconds / 3600.0;
+}
+
+static int selected_time_clock_index(GtkWidget *dialog) {
+    GtkWidget *tree = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_tree"));
+    if (!tree) return -1;
+
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    if (!gtk_tree_selection_get_selected(selection, &model, &iter)) return -1;
+
+    int idx = -1;
+    gtk_tree_model_get(model, &iter, 0, &idx, -1);
+    return idx;
+}
+
+static void refresh_time_clock_store(GtkWidget *dialog) {
+    GtkListStore *store_list = GTK_LIST_STORE(g_object_get_data(G_OBJECT(dialog), "time_clock_store"));
+    GtkWidget *from_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_from"));
+    GtkWidget *to_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_to"));
+    GtkWidget *show_hidden = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_show_hidden"));
+    if (!store_list || !from_entry || !to_entry || !show_hidden) return;
+
+    const char *from_date = gtk_entry_get_text(GTK_ENTRY(from_entry));
+    const char *to_date = gtk_entry_get_text(GTK_ENTRY(to_entry));
+    int include_hidden = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(show_hidden));
+
+    gtk_list_store_clear(store_list);
+
+    for (int i = 0; i < time_clock_count; i++) {
+        TimeClockEntry *e = &time_clock_entries[i];
+        if (!include_hidden && e->hidden) continue;
+
+        char entry_date[11] = "";
+        strncpy(entry_date, e->start_time, 10);
+        entry_date[10] = '\0';
+        if (strlen(from_date) >= 10 && strcmp(entry_date, from_date) < 0) continue;
+        if (strlen(to_date) >= 10 && strcmp(entry_date, to_date) > 0) continue;
+
+        char hours_str[32];
+        if (e->has_end_time) {
+            sprintf(hours_str, "%.2f", compute_time_clock_hours(e));
+        } else {
+            strcpy(hours_str, "Open");
+        }
+
+        GtkTreeIter iter;
+        gtk_list_store_append(store_list, &iter);
+        gtk_list_store_set(store_list, &iter,
+                          0, i,
+                          1, e->user_name,
+                          2, e->start_time,
+                          3, e->has_end_time ? e->end_time : "(Still Working)",
+                          4, hours_str,
+                          5, e->hidden ? "Yes" : "No",
+                          -1);
+    }
+}
+
+static void on_refresh_time_clock_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    refresh_time_clock_store(GTK_WIDGET(data));
+}
+
+static void open_time_clock_entry_editor(GtkWidget *parent_dialog, int edit_index) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(edit_index >= 0 ? "Edit Time Clock Entry" : "Add Time Clock Entry",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Save", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *user_combo = gtk_combo_box_text_new_with_entry();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(user_combo), "Manager");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(user_combo), "Sales Associate");
+    for (int i = 0; i < time_clock_count; i++) {
+        if (strlen(time_clock_entries[i].user_name) > 0) {
+            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(user_combo), time_clock_entries[i].user_name);
+        }
+    }
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("User:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), user_combo, FALSE, FALSE, 0);
+
+    GtkWidget *start_entry = create_labeled_entry("Start Time (YYYY-MM-DD HH:MM):", vbox);
+    GtkWidget *has_end_check = gtk_check_button_new_with_label("End Time");
+    gtk_box_pack_start(GTK_BOX(vbox), has_end_check, FALSE, FALSE, 0);
+    GtkWidget *end_entry = create_labeled_entry("End Time (YYYY-MM-DD HH:MM):", vbox);
+
+    if (edit_index >= 0 && edit_index < time_clock_count) {
+        TimeClockEntry *e = &time_clock_entries[edit_index];
+        GtkWidget *user_entry = gtk_bin_get_child(GTK_BIN(user_combo));
+        gtk_entry_set_text(GTK_ENTRY(user_entry), e->user_name);
+        gtk_entry_set_text(GTK_ENTRY(start_entry), e->start_time);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(has_end_check), e->has_end_time);
+        gtk_entry_set_text(GTK_ENTRY(end_entry), e->end_time);
+    } else {
+        char now_dt[NAME_LEN];
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        strftime(now_dt, sizeof(now_dt), "%Y-%m-%d %H:%M", tm_info);
+        gtk_entry_set_text(GTK_ENTRY(start_entry), now_dt);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(has_end_check), 1);
+        gtk_entry_set_text(GTK_ENTRY(end_entry), now_dt);
+    }
+
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        GtkWidget *user_entry = gtk_bin_get_child(GTK_BIN(user_combo));
+        const char *user_name = gtk_entry_get_text(GTK_ENTRY(user_entry));
+        const char *start_time = gtk_entry_get_text(GTK_ENTRY(start_entry));
+        int has_end = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(has_end_check));
+        const char *end_time = gtk_entry_get_text(GTK_ENTRY(end_entry));
+
+        struct tm test_tm;
+        if (strlen(user_name) == 0) {
+            show_error_dialog("User is required.");
+        } else if (!parse_datetime_str(start_time, &test_tm)) {
+            show_error_dialog("Start Time must use format YYYY-MM-DD HH:MM.");
+        } else if (has_end && !parse_datetime_str(end_time, &test_tm)) {
+            show_error_dialog("End Time must use format YYYY-MM-DD HH:MM.");
+        } else if (edit_index < 0 && time_clock_count >= MAX_TIME_CLOCK_ENTRIES) {
+            show_error_dialog("Maximum time clock entries reached.");
+        } else {
+            TimeClockEntry *entry;
+            if (edit_index >= 0 && edit_index < time_clock_count) {
+                entry = &time_clock_entries[edit_index];
+            } else {
+                entry = &time_clock_entries[time_clock_count++];
+                entry->hidden = 0;
+            }
+            strncpy(entry->user_name, user_name, NAME_LEN - 1);
+            entry->user_name[NAME_LEN - 1] = '\0';
+            strncpy(entry->start_time, start_time, NAME_LEN - 1);
+            entry->start_time[NAME_LEN - 1] = '\0';
+            entry->has_end_time = has_end;
+            if (has_end) {
+                strncpy(entry->end_time, end_time, NAME_LEN - 1);
+                entry->end_time[NAME_LEN - 1] = '\0';
+            } else {
+                strcpy(entry->end_time, "");
+            }
+
+            save_data();
+            refresh_time_clock_store(parent_dialog);
+            show_info_dialog("Time clock entry saved.");
+        }
+    }
+
+    gtk_widget_destroy(dialog);
+}
+
+static void on_add_time_clock_clicked(GtkToolButton *button, gpointer data) {
+    (void)button;
+    open_time_clock_entry_editor(GTK_WIDGET(data), -1);
+}
+
+static void on_edit_time_clock_clicked(GtkToolButton *button, gpointer data) {
+    (void)button;
+    GtkWidget *dialog = GTK_WIDGET(data);
+    int idx = selected_time_clock_index(dialog);
+    if (idx < 0 || idx >= time_clock_count) {
+        show_error_dialog("Select a time clock entry to modify.");
+        return;
+    }
+    open_time_clock_entry_editor(dialog, idx);
+}
+
+static void on_remove_time_clock_clicked(GtkToolButton *button, gpointer data) {
+    (void)button;
+    GtkWidget *dialog = GTK_WIDGET(data);
+    int idx = selected_time_clock_index(dialog);
+    if (idx < 0 || idx >= time_clock_count) {
+        show_error_dialog("Select a time clock entry to remove.");
+        return;
+    }
+    time_clock_entries[idx].hidden = 1;
+    save_data();
+    refresh_time_clock_store(dialog);
+    show_info_dialog("Time clock entry removed.");
+}
+
+static void on_restore_time_clock_clicked(GtkToolButton *button, gpointer data) {
+    (void)button;
+    GtkWidget *dialog = GTK_WIDGET(data);
+    int idx = selected_time_clock_index(dialog);
+    if (idx < 0 || idx >= time_clock_count) {
+        show_error_dialog("Select a hidden time clock entry to restore.");
+        return;
+    }
+    time_clock_entries[idx].hidden = 0;
+    save_data();
+    refresh_time_clock_store(dialog);
+    show_info_dialog("Time clock entry restored.");
+}
+
+static void time_clock_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Time Clock",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *toolbar = gtk_toolbar_new();
+    gtk_toolbar_set_style(GTK_TOOLBAR(toolbar), GTK_TOOLBAR_BOTH);
+    GtkToolItem *add_item = gtk_tool_button_new(NULL, "Add");
+    GtkToolItem *edit_item = gtk_tool_button_new(NULL, "Modify");
+    GtkToolItem *remove_item = gtk_tool_button_new(NULL, "Remove");
+    GtkToolItem *restore_item = gtk_tool_button_new(NULL, "Restore");
+    gtk_toolbar_insert(GTK_TOOLBAR(toolbar), add_item, -1);
+    gtk_toolbar_insert(GTK_TOOLBAR(toolbar), edit_item, -1);
+    gtk_toolbar_insert(GTK_TOOLBAR(toolbar), remove_item, -1);
+    gtk_toolbar_insert(GTK_TOOLBAR(toolbar), restore_item, -1);
+    gtk_box_pack_start(GTK_BOX(vbox), toolbar, FALSE, FALSE, 0);
+
+    GtkWidget *filter_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(vbox), filter_box, FALSE, FALSE, 0);
+    GtkWidget *from_entry = gtk_entry_new();
+    GtkWidget *to_entry = gtk_entry_new();
+    char today[NAME_LEN];
+    get_today_date(today, sizeof(today));
+    gtk_entry_set_text(GTK_ENTRY(from_entry), today);
+    gtk_entry_set_text(GTK_ENTRY(to_entry), today);
+    gtk_box_pack_start(GTK_BOX(filter_box), gtk_label_new("From (YYYY-MM-DD):"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(filter_box), from_entry, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(filter_box), gtk_label_new("To (YYYY-MM-DD):"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(filter_box), to_entry, FALSE, FALSE, 0);
+    GtkWidget *show_hidden = gtk_check_button_new_with_label("Show Hidden");
+    gtk_box_pack_start(GTK_BOX(filter_box), show_hidden, FALSE, FALSE, 0);
+    GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh");
+    gtk_box_pack_start(GTK_BOX(filter_box), refresh_btn, FALSE, FALSE, 0);
+
+    GtkWidget *list_sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(list_sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(list_sw, 760, 320);
+    gtk_box_pack_start(GTK_BOX(vbox), list_sw, TRUE, TRUE, 0);
+
+    GtkListStore *store_list = gtk_list_store_new(6,
+                                                   G_TYPE_INT,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_STRING);
+
+    GtkTreeView *tree = GTK_TREE_VIEW(gtk_tree_view_new_with_model(GTK_TREE_MODEL(store_list)));
+    GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "User", renderer, "text", 1, NULL);
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "Start Time", renderer, "text", 2, NULL);
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "End Time", renderer, "text", 3, NULL);
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "Hours", renderer, "text", 4, NULL);
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "Hidden", renderer, "text", 5, NULL);
+    gtk_container_add(GTK_CONTAINER(list_sw), GTK_WIDGET(tree));
+
+    g_object_set_data(G_OBJECT(dialog), "time_clock_store", store_list);
+    g_object_set_data(G_OBJECT(dialog), "time_clock_tree", tree);
+    g_object_set_data(G_OBJECT(dialog), "time_clock_from", from_entry);
+    g_object_set_data(G_OBJECT(dialog), "time_clock_to", to_entry);
+    g_object_set_data(G_OBJECT(dialog), "time_clock_show_hidden", show_hidden);
+
+    g_signal_connect(add_item, "clicked", G_CALLBACK(on_add_time_clock_clicked), dialog);
+    g_signal_connect(edit_item, "clicked", G_CALLBACK(on_edit_time_clock_clicked), dialog);
+    g_signal_connect(remove_item, "clicked", G_CALLBACK(on_remove_time_clock_clicked), dialog);
+    g_signal_connect(restore_item, "clicked", G_CALLBACK(on_restore_time_clock_clicked), dialog);
+    g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_time_clock_clicked), dialog);
+
+    refresh_time_clock_store(dialog);
+
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static void time_clock_report_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Time Clock Report",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *filter_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(vbox), filter_box, FALSE, FALSE, 0);
+    GtkWidget *from_entry = gtk_entry_new();
+    GtkWidget *to_entry = gtk_entry_new();
+    char today[NAME_LEN];
+    get_today_date(today, sizeof(today));
+    gtk_entry_set_text(GTK_ENTRY(from_entry), today);
+    gtk_entry_set_text(GTK_ENTRY(to_entry), today);
+    gtk_box_pack_start(GTK_BOX(filter_box), gtk_label_new("From (YYYY-MM-DD):"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(filter_box), from_entry, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(filter_box), gtk_label_new("To (YYYY-MM-DD):"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(filter_box), to_entry, FALSE, FALSE, 0);
+
+    GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh");
+    gtk_box_pack_start(GTK_BOX(filter_box), refresh_btn, FALSE, FALSE, 0);
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(sw, 700, 340);
+    gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
+    GtkWidget *text_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+    gtk_container_add(GTK_CONTAINER(sw), text_view);
+
+    g_object_set_data(G_OBJECT(dialog), "time_clock_report_from", from_entry);
+    g_object_set_data(G_OBJECT(dialog), "time_clock_report_to", to_entry);
+    g_object_set_data(G_OBJECT(dialog), "time_clock_report_text", text_view);
+
+    g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_time_clock_report_clicked), dialog);
+
+    refresh_time_clock_report(dialog);
+
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static void on_refresh_time_clock_report_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    refresh_time_clock_report(GTK_WIDGET(data));
+}
+
+static void refresh_time_clock_report(GtkWidget *dialog) {
+    GtkWidget *from_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_report_from"));
+    GtkWidget *to_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_report_to"));
+    GtkWidget *text_view = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_report_text"));
+    if (!from_entry || !to_entry || !text_view) return;
+
+    const char *from_date = gtk_entry_get_text(GTK_ENTRY(from_entry));
+    const char *to_date = gtk_entry_get_text(GTK_ENTRY(to_entry));
+    double total_hours = 0.0;
+    char report[12000] = "TIME CLOCK REPORT\n\n";
+    char line[256];
+
+    for (int i = 0; i < time_clock_count; i++) {
+        TimeClockEntry *e = &time_clock_entries[i];
+        if (e->hidden) continue;
+        char entry_date[11] = "";
+        strncpy(entry_date, e->start_time, 10);
+        entry_date[10] = '\0';
+        if (strlen(from_date) >= 10 && strcmp(entry_date, from_date) < 0) continue;
+        if (strlen(to_date) >= 10 && strcmp(entry_date, to_date) > 0) continue;
+
+        double h = compute_time_clock_hours(e);
+        if (e->has_end_time) {
+            sprintf(line, "%s | %s -> %s | %.2f hrs\n", e->user_name, e->start_time, e->end_time, h);
+            total_hours += h;
+        } else {
+            sprintf(line, "%s | %s -> (Still Working)\n", e->user_name, e->start_time);
+        }
+        strncat(report, line, sizeof(report) - strlen(report) - 1);
+    }
+
+    sprintf(line, "\nTotal Closed-Shift Hours: %.2f\n", total_hours);
+    strncat(report, line, sizeof(report) - strlen(report) - 1);
+
+    GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+    gtk_text_buffer_set_text(buf, report, -1);
 }
 
 
@@ -1212,6 +1794,7 @@ static void save_data(void) {
             Transaction *txn = &s->sales[t];
             fprintf(f, "%s\n%d\n%d %.2f %.2f %d %d\n%s\n", txn->transaction_id, txn->customer_idx, txn->item_count, txn->total, txn->amount_paid, txn->payment_type, txn->status, txn->notes);
             fprintf(f, "%s\n%d\n", txn->date, txn->print_receipt);
+                        fprintf(f, "%d\n%s\n", txn->is_return, txn->original_transaction_id);
             for (int k = 0; k < txn->item_count; k++) {
                 fprintf(f, "%s %.2f %d\n", txn->item_sku[k], txn->item_price[k], txn->qty[k]);
             }
@@ -1231,6 +1814,24 @@ static void save_data(void) {
                     order->notification_method, order->transfer_store_idx, order->notified);
         }
     }
+
+    fprintf(f, "TAX_EXCEPTIONS\n%d\n", tax_exception_count);
+    for (int i = 0; i < tax_exception_count; i++) {
+        TaxExceptionReason *r = &tax_exceptions[i];
+        fprintf(f, "%s\n%d\n%d\n", r->description, r->requires_tax_id, r->hidden);
+    }
+
+    fprintf(f, "TIME_CLOCK\n%d\n", time_clock_count);
+    for (int i = 0; i < time_clock_count; i++) {
+        TimeClockEntry *e = &time_clock_entries[i];
+        fprintf(f, "%s\n%s\n%d\n%s\n%d\n",
+                e->user_name,
+                e->start_time,
+                e->has_end_time,
+                e->end_time,
+                e->hidden);
+    }
+
     fclose(f);
 }
 
@@ -1359,6 +1960,9 @@ static void load_data(void) {
                 if (!fgets(txn->date, NAME_LEN, f)) break;
                 txn->date[strcspn(txn->date, "\n")] = '\0';
                 fscanf(f, "%d\n", &txn->print_receipt);
+                                fscanf(f, "%d\n", &txn->is_return);
+                                if (!fgets(txn->original_transaction_id, NAME_LEN, f)) break;
+                                txn->original_transaction_id[strcspn(txn->original_transaction_id, "\n")] = '\0';
                 if (txn->item_count > MAX_PRODUCTS) txn->item_count = MAX_PRODUCTS;
                 for (int k = 0; k < txn->item_count; k++) {
                     fscanf(f, "%s %lf %d\n", txn->item_sku[k], &txn->item_price[k], &txn->qty[k]);
@@ -1400,6 +2004,71 @@ static void load_data(void) {
 
         store_count++;
     }
+
+    tax_exception_count = 0;
+    time_clock_count = 0;
+
+    char section_name[NAME_LEN];
+    while (fscanf(f, "%63s", section_name) == 1) {
+        if (strcmp(section_name, "TAX_EXCEPTIONS") == 0) {
+            int count = 0;
+            if (fscanf(f, "%d\n", &count) != 1) break;
+            int limit = (count < MAX_TAX_EXCEPTIONS) ? count : MAX_TAX_EXCEPTIONS;
+            tax_exception_count = limit;
+            for (int i = 0; i < count; i++) {
+                char desc_buf[NAME_LEN * 2];
+                int req_tax = 0;
+                int hidden = 0;
+                if (!fgets(desc_buf, sizeof(desc_buf), f)) break;
+                desc_buf[strcspn(desc_buf, "\n")] = '\0';
+                if (fscanf(f, "%d\n%d\n", &req_tax, &hidden) != 2) break;
+
+                if (i < limit) {
+                    TaxExceptionReason *r = &tax_exceptions[i];
+                    strncpy(r->description, desc_buf, sizeof(r->description) - 1);
+                    r->description[sizeof(r->description) - 1] = '\0';
+                    r->requires_tax_id = req_tax;
+                    r->hidden = hidden;
+                }
+            }
+        } else if (strcmp(section_name, "TIME_CLOCK") == 0) {
+            int count = 0;
+            if (fscanf(f, "%d\n", &count) != 1) break;
+            int limit = (count < MAX_TIME_CLOCK_ENTRIES) ? count : MAX_TIME_CLOCK_ENTRIES;
+            time_clock_count = limit;
+            for (int i = 0; i < count; i++) {
+                char user_buf[NAME_LEN];
+                char start_buf[NAME_LEN];
+                int has_end = 0;
+                char end_buf[NAME_LEN];
+                int hidden = 0;
+
+                if (!fgets(user_buf, sizeof(user_buf), f)) break;
+                user_buf[strcspn(user_buf, "\n")] = '\0';
+                if (!fgets(start_buf, sizeof(start_buf), f)) break;
+                start_buf[strcspn(start_buf, "\n")] = '\0';
+                if (fscanf(f, "%d\n", &has_end) != 1) break;
+                if (!fgets(end_buf, sizeof(end_buf), f)) break;
+                end_buf[strcspn(end_buf, "\n")] = '\0';
+                if (fscanf(f, "%d\n", &hidden) != 1) break;
+
+                if (i < limit) {
+                    TimeClockEntry *e = &time_clock_entries[i];
+                    strncpy(e->user_name, user_buf, NAME_LEN - 1);
+                    e->user_name[NAME_LEN - 1] = '\0';
+                    strncpy(e->start_time, start_buf, NAME_LEN - 1);
+                    e->start_time[NAME_LEN - 1] = '\0';
+                    e->has_end_time = has_end;
+                    strncpy(e->end_time, end_buf, NAME_LEN - 1);
+                    e->end_time[NAME_LEN - 1] = '\0';
+                    e->hidden = hidden;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
     fclose(f);
 }
 
@@ -2281,7 +2950,481 @@ static void create_layaway_dialog(void) {
     gtk_widget_destroy(txn_dialog);
 }
 
+static void on_return_item_toggle(GtkCellRendererToggle *renderer, gchar *path_str, gpointer data) {
+        (void)renderer;
+        GtkListStore *store = GTK_LIST_STORE(data);
+        GtkTreeIter iter;
+        GtkTreePath *path = gtk_tree_path_new_from_string(path_str);
+        gboolean active;
+        gtk_tree_model_get_iter(GTK_TREE_MODEL(store), &iter, path);
+        gtk_tree_model_get(GTK_TREE_MODEL(store), &iter, 0, &active, -1);
+        gtk_list_store_set(store, &iter, 0, !active, -1);
+        gtk_tree_path_free(path);
+    }
+
+static void create_return_dialog(void) {
+        int si = choose_store_index();
+        if (si < 0) return;
+        Store *s = &stores[si];
+
+        if (s->sales_count >= MAX_TRANSACTIONS) {
+            show_error_dialog("Maximum transactions reached for this store.");
+            return;
+        }
+
+        // Initialize return transaction
+        Transaction ret_txn;
+        memset(&ret_txn, 0, sizeof(Transaction));
+        ret_txn.status = 1; // completed
+        ret_txn.customer_idx = -1;
+        ret_txn.is_return = 1;
+        sprintf(ret_txn.transaction_id, "RET-%d-%ld", si, (long)time(NULL) % 10000);
+        strcpy(ret_txn.original_transaction_id, "");
+
+        // === STEP 1: Previous Sales Items window ===
+        GtkWidget *prev_dialog = gtk_dialog_new_with_buttons("Previous Sales Items",
+                                                             GTK_WINDOW(main_window),
+                                                             GTK_DIALOG_MODAL,
+                                                             "_Lookup", 1,
+                                                             "_Add", 2,
+                                                             "_No Receipt", GTK_RESPONSE_CANCEL,
+                                                             NULL);
+        GtkWidget *prev_area = gtk_dialog_get_content_area(GTK_DIALOG(prev_dialog));
+        GtkWidget *prev_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+        gtk_container_set_border_width(GTK_CONTAINER(prev_vbox), 10);
+        gtk_container_add(GTK_CONTAINER(prev_area), prev_vbox);
+
+        gtk_box_pack_start(GTK_BOX(prev_vbox),
+            gtk_label_new("Scan or type the barcode from the customer's receipt, then click Lookup.\n"
+                          "Click 'No Receipt' to add return items manually."),
+            FALSE, FALSE, 0);
+
+        GtkWidget *barcode_entry = create_labeled_entry("Sales Receipt Number:", prev_vbox);
+
+        GtkWidget *items_sw = gtk_scrolled_window_new(NULL, NULL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(items_sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+        gtk_widget_set_size_request(items_sw, -1, 180);
+        gtk_box_pack_start(GTK_BOX(prev_vbox), items_sw, TRUE, TRUE, 0);
+
+        // columns: 0=return(bool), 1=product name, 2=sku, 3=qty(int), 4=price(double), 5=item_idx(int)
+        GtkListStore *items_store = gtk_list_store_new(6,
+                                                        G_TYPE_BOOLEAN,
+                                                        G_TYPE_STRING,
+                                                        G_TYPE_STRING,
+                                                        G_TYPE_INT,
+                                                        G_TYPE_DOUBLE,
+                                                        G_TYPE_INT);
+
+        GtkTreeView *items_tree = GTK_TREE_VIEW(gtk_tree_view_new_with_model(GTK_TREE_MODEL(items_store)));
+
+        GtkCellRenderer *toggle_rend = gtk_cell_renderer_toggle_new();
+        gtk_cell_renderer_toggle_set_activatable(GTK_CELL_RENDERER_TOGGLE(toggle_rend), TRUE);
+        g_signal_connect(toggle_rend, "toggled", G_CALLBACK(on_return_item_toggle), items_store);
+        gtk_tree_view_insert_column_with_attributes(items_tree, -1, "Return", toggle_rend, "active", 0, NULL);
+
+        GtkCellRenderer *text_rend = gtk_cell_renderer_text_new();
+        gtk_tree_view_insert_column_with_attributes(items_tree, -1, "Product", text_rend, "text", 1, NULL);
+        gtk_tree_view_insert_column_with_attributes(items_tree, -1, "SKU", text_rend, "text", 2, NULL);
+        gtk_tree_view_insert_column_with_attributes(items_tree, -1, "Qty", text_rend, "text", 3, NULL);
+        gtk_tree_view_insert_column_with_attributes(items_tree, -1, "Price", text_rend, "text", 4, NULL);
+
+        gtk_container_add(GTK_CONTAINER(items_sw), GTK_WIDGET(items_tree));
+        gtk_widget_set_size_request(prev_dialog, 580, 440);
+        gtk_widget_show_all(prev_dialog);
+
+        Transaction *orig_txn = NULL;
+        int from_receipt = 0;
+        int done_prev = 0;
+        while (!done_prev) {
+            int resp = gtk_dialog_run(GTK_DIALOG(prev_dialog));
+            if (resp == 1) { // Lookup
+                const char *barcode = gtk_entry_get_text(GTK_ENTRY(barcode_entry));
+                if (strlen(barcode) == 0) {
+                    show_error_dialog("Please enter a receipt number.");
+                    continue;
+                }
+                orig_txn = NULL;
+                for (int i = 0; i < s->sales_count; i++) {
+                    if (!s->sales[i].is_return && strcmp(s->sales[i].transaction_id, barcode) == 0) {
+                        orig_txn = &s->sales[i];
+                        break;
+                    }
+                }
+                if (!orig_txn) {
+                    show_error_dialog("Transaction not found. Check the receipt number.");
+                    continue;
+                }
+                // Populate items list (all pre-checked)
+                gtk_list_store_clear(items_store);
+                for (int k = 0; k < orig_txn->item_count; k++) {
+                    if (orig_txn->qty[k] < 0) continue; // skip already-return items
+                    Product *p = NULL;
+                    for (int j = 0; j < s->product_count; j++) {
+                        if (strcmp(s->products[j].sku, orig_txn->item_sku[k]) == 0) {
+                            p = &s->products[j];
+                            break;
+                        }
+                    }
+                    GtkTreeIter iter;
+                    gtk_list_store_append(items_store, &iter);
+                    gtk_list_store_set(items_store, &iter,
+                                      0, TRUE,
+                                      1, p ? p->name : orig_txn->item_sku[k],
+                                      2, orig_txn->item_sku[k],
+                                      3, orig_txn->qty[k],
+                                      4, orig_txn->item_price[k],
+                                      5, k,
+                                      -1);
+                }
+            } else if (resp == 2) { // Add
+                if (!orig_txn) {
+                    show_error_dialog("Please click Lookup to find a transaction first,\nor click 'No Receipt' to add items manually.");
+                    continue;
+                }
+                // Verify at least one item is checked
+                gboolean any_sel = FALSE;
+                GtkTreeIter iter;
+                gboolean valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(items_store), &iter);
+                while (valid) {
+                    gboolean sel;
+                    gtk_tree_model_get(GTK_TREE_MODEL(items_store), &iter, 0, &sel, -1);
+                    if (sel) { any_sel = TRUE; break; }
+                    valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(items_store), &iter);
+                }
+                if (!any_sel) {
+                    show_error_dialog("Please check at least one item to return.");
+                    continue;
+                }
+                // Build return items from checked rows
+                valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(items_store), &iter);
+                while (valid && ret_txn.item_count < MAX_PRODUCTS) {
+                    gboolean sel;
+                    gchar *sku_str;
+                    gint qty_val;
+                    gdouble price_val;
+                    gtk_tree_model_get(GTK_TREE_MODEL(items_store), &iter,
+                                       0, &sel, 2, &sku_str, 3, &qty_val, 4, &price_val, -1);
+                    if (sel) {
+                        strncpy(ret_txn.item_sku[ret_txn.item_count], sku_str, NAME_LEN - 1);
+                        ret_txn.item_price[ret_txn.item_count] = price_val;
+                        ret_txn.qty[ret_txn.item_count] = -qty_val; // NEGATIVE qty = return
+                        ret_txn.total += price_val * (-qty_val);
+                        ret_txn.item_count++;
+                    }
+                    g_free(sku_str);
+                    valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(items_store), &iter);
+                }
+                strncpy(ret_txn.original_transaction_id, orig_txn->transaction_id, NAME_LEN - 1);
+                from_receipt = 1;
+                done_prev = 1;
+            } else { // No Receipt or window closed
+                from_receipt = 0;
+                orig_txn = NULL;
+                done_prev = 1;
+            }
+        }
+        gtk_widget_destroy(prev_dialog);
+
+        // === STEP 2: Ask about crediting original customer (receipt mode) ===
+        if (from_receipt && orig_txn) {
+            int orig_ci = orig_txn->customer_idx;
+            if (orig_ci >= 0 && orig_ci < s->customer_count) {
+                Customer *oc = &s->customers[orig_ci];
+                char cq_msg[256];
+                sprintf(cq_msg,
+                        "Would you like to credit the selected return items\n"
+                        "to the original customer?\n\nOriginal Customer: %s %s",
+                        oc->first_name, oc->last_name);
+                GtkWidget *cq_dlg = gtk_dialog_new_with_buttons("Credit Original Customer?",
+                                                                GTK_WINDOW(main_window),
+                                                                GTK_DIALOG_MODAL,
+                                                                "_Yes", GTK_RESPONSE_YES,
+                                                                "_No", GTK_RESPONSE_NO,
+                                                                NULL);
+                GtkWidget *cq_area = gtk_dialog_get_content_area(GTK_DIALOG(cq_dlg));
+                gtk_container_set_border_width(GTK_CONTAINER(cq_area), 15);
+                GtkWidget *cq_label = gtk_label_new(cq_msg);
+                gtk_container_add(GTK_CONTAINER(cq_area), cq_label);
+                gtk_widget_show_all(cq_dlg);
+                if (gtk_dialog_run(GTK_DIALOG(cq_dlg)) == GTK_RESPONSE_YES) {
+                    ret_txn.customer_idx = orig_ci;
+                }
+                gtk_widget_destroy(cq_dlg);
+            }
+        }
+
+        // === STEP 3: Customer selection if not yet attached ===
+        if (ret_txn.customer_idx < 0) {
+            if (s->customer_count == 0) {
+                show_error_dialog("No customers in this store. Add a customer first.");
+                return;
+            }
+            GtkWidget *cust_dlg = gtk_dialog_new_with_buttons("Select Customer for Return",
+                                                             GTK_WINDOW(main_window),
+                                                             GTK_DIALOG_MODAL,
+                                                             "_OK", GTK_RESPONSE_OK,
+                                                             "_Cancel", GTK_RESPONSE_CANCEL,
+                                                             NULL);
+            GtkWidget *cust_area = gtk_dialog_get_content_area(GTK_DIALOG(cust_dlg));
+            GtkWidget *cust_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+            gtk_container_set_border_width(GTK_CONTAINER(cust_box), 10);
+            gtk_container_add(GTK_CONTAINER(cust_area), cust_box);
+            GtkWidget *cust_combo = gtk_combo_box_text_new();
+            for (int i = 0; i < s->customer_count; i++) {
+                if (s->customers[i].hidden) continue;
+                Customer *c = &s->customers[i];
+                char entry[NAME_LEN * 2];
+                sprintf(entry, "%s %s (%s)", c->first_name, c->last_name, c->company);
+                gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(cust_combo), entry);
+            }
+            gtk_box_pack_start(GTK_BOX(cust_box), gtk_label_new("Select Customer:"), FALSE, FALSE, 0);
+            gtk_box_pack_start(GTK_BOX(cust_box), cust_combo, FALSE, FALSE, 0);
+            gtk_widget_show_all(cust_dlg);
+            if (gtk_dialog_run(GTK_DIALOG(cust_dlg)) != GTK_RESPONSE_OK) {
+                gtk_widget_destroy(cust_dlg);
+                return;
+            }
+            int ci = gtk_combo_box_get_active(GTK_COMBO_BOX(cust_combo));
+            if (ci >= 0 && ci < s->customer_count) {
+                ret_txn.customer_idx = ci;
+            }
+            gtk_widget_destroy(cust_dlg);
+        }
+
+        // === STEP 4: Return transaction editor ===
+        GtkWidget *ret_edit = gtk_dialog_new_with_buttons("Return Transaction",
+                                                          GTK_WINDOW(main_window),
+                                                          GTK_DIALOG_MODAL,
+                                                          "_Add Item", 1,
+                                                          "_Process Refund", 2,
+                                                          "_Cancel", GTK_RESPONSE_CANCEL,
+                                                          NULL);
+        GtkWidget *ret_area = gtk_dialog_get_content_area(GTK_DIALOG(ret_edit));
+        GtkWidget *ret_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+        gtk_container_set_border_width(GTK_CONTAINER(ret_box), 8);
+        gtk_container_add(GTK_CONTAINER(ret_area), ret_box);
+
+        // Customer header
+        char cust_hdr[NAME_LEN * 3];
+        if (ret_txn.customer_idx >= 0) {
+            Customer *c = &s->customers[ret_txn.customer_idx];
+            sprintf(cust_hdr, "Customer: %s %s", c->first_name, c->last_name);
+        } else {
+            sprintf(cust_hdr, "Customer: Not selected");
+        }
+        gtk_box_pack_start(GTK_BOX(ret_box), gtk_label_new(cust_hdr), FALSE, FALSE, 0);
+
+        if (strlen(ret_txn.original_transaction_id) > 0) {
+            char orig_hdr[NAME_LEN + 32];
+            sprintf(orig_hdr, "Original Transaction: %s", ret_txn.original_transaction_id);
+            gtk_box_pack_start(GTK_BOX(ret_box), gtk_label_new(orig_hdr), FALSE, FALSE, 0);
+        }
+
+        GtkWidget *ret_note = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(ret_note), "<b>RETURN - negative quantities indicate items being refunded</b>");
+        gtk_box_pack_start(GTK_BOX(ret_box), ret_note, FALSE, FALSE, 0);
+
+        GtkWidget *item_sw2 = gtk_scrolled_window_new(NULL, NULL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(item_sw2), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+        GtkWidget *item_view2 = gtk_text_view_new();
+        gtk_text_view_set_editable(GTK_TEXT_VIEW(item_view2), FALSE);
+        gtk_container_add(GTK_CONTAINER(item_sw2), item_view2);
+        gtk_box_pack_start(GTK_BOX(ret_box), item_sw2, TRUE, TRUE, 0);
+
+        GtkWidget *balance_label = gtk_label_new("Balance: $0.00");
+        gtk_box_pack_start(GTK_BOX(ret_box), balance_label, FALSE, FALSE, 0);
+
+        gtk_widget_set_size_request(ret_edit, 520, 420);
+        gtk_widget_show_all(ret_edit);
+
+        int done_ret = 0;
+        while (!done_ret) {
+            // Refresh item list
+            GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(item_view2));
+            char item_text[3000] = "RETURN ITEMS:\n\n";
+            for (int i = 0; i < ret_txn.item_count; i++) {
+                Product *p = NULL;
+                for (int j = 0; j < s->product_count; j++) {
+                    if (strcmp(s->products[j].sku, ret_txn.item_sku[i]) == 0) {
+                        p = &s->products[j];
+                        break;
+                    }
+                }
+                char line[256];
+                sprintf(line, "%d. %s (SKU: %s)  Qty: %d  @ $%.2f = $%.2f\n",
+                        i + 1,
+                        p ? p->name : ret_txn.item_sku[i],
+                        ret_txn.item_sku[i],
+                        ret_txn.qty[i],
+                        ret_txn.item_price[i],
+                        ret_txn.item_price[i] * ret_txn.qty[i]);
+                strncat(item_text, line, sizeof(item_text) - strlen(item_text) - 1);
+            }
+            gtk_text_buffer_set_text(buf, item_text, -1);
+
+            // Balance in parens if negative (store pays customer)
+            char bal_str[64];
+            if (ret_txn.total < 0.0) {
+                sprintf(bal_str, "Balance: ($%.2f)", -ret_txn.total);
+            } else {
+                sprintf(bal_str, "Balance: $%.2f", ret_txn.total);
+            }
+            gtk_label_set_text(GTK_LABEL(balance_label), bal_str);
+
+            int resp2 = gtk_dialog_run(GTK_DIALOG(ret_edit));
+
+            if (resp2 == 1) { // Add Item manually
+                GtkWidget *add_dlg = gtk_dialog_new_with_buttons("Add Return Item",
+                                                                 GTK_WINDOW(main_window),
+                                                                 GTK_DIALOG_MODAL,
+                                                                 "_Add", GTK_RESPONSE_OK,
+                                                                 "_Cancel", GTK_RESPONSE_CANCEL,
+                                                                 NULL);
+                GtkWidget *add_area = gtk_dialog_get_content_area(GTK_DIALOG(add_dlg));
+                GtkWidget *add_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+                gtk_container_set_border_width(GTK_CONTAINER(add_box), 10);
+                gtk_container_add(GTK_CONTAINER(add_area), add_box);
+
+                GtkWidget *sku_e = create_labeled_entry("SKU/UPC:", add_box);
+                GtkWidget *qty_e = create_labeled_entry("Quantity (positive, will be returned):", add_box);
+                gtk_entry_set_text(GTK_ENTRY(qty_e), "1");
+                GtkWidget *price_e = create_labeled_entry("Refund Price:", add_box);
+
+                gtk_box_pack_start(GTK_BOX(add_box),
+                    gtk_label_new("Note: Ascend uses the lowest price the item was\never sold for to prevent fraud. Adjust if needed."),
+                    FALSE, FALSE, 0);
+
+                gtk_widget_show_all(add_dlg);
+
+                if (gtk_dialog_run(GTK_DIALOG(add_dlg)) == GTK_RESPONSE_OK) {
+                    const char *sku_in = gtk_entry_get_text(GTK_ENTRY(sku_e));
+                    int qty_in = atoi(gtk_entry_get_text(GTK_ENTRY(qty_e)));
+                    const char *price_in_str = gtk_entry_get_text(GTK_ENTRY(price_e));
+
+                    Product *p = NULL;
+                    for (int j = 0; j < s->product_count; j++) {
+                        if (strcmp(s->products[j].sku, sku_in) == 0) {
+                            p = &s->products[j];
+                            break;
+                        }
+                    }
+
+                    if (!p) {
+                        show_error_dialog("Product not found. Check SKU/UPC.");
+                    } else if (qty_in <= 0) {
+                        show_error_dialog("Quantity must be a positive number.");
+                    } else if (ret_txn.item_count < MAX_PRODUCTS) {
+                        // Find lowest price this item was ever sold for
+                        double lowest = p->price;
+                        for (int t = 0; t < s->sales_count; t++) {
+                            if (s->sales[t].is_return) continue;
+                            for (int k = 0; k < s->sales[t].item_count; k++) {
+                                if (strcmp(s->sales[t].item_sku[k], sku_in) == 0
+                                        && s->sales[t].item_price[k] > 0.0
+                                        && s->sales[t].item_price[k] < lowest) {
+                                    lowest = s->sales[t].item_price[k];
+                                }
+                            }
+                        }
+
+                        // Use entered price if provided, otherwise lowest
+                        double refund_price = (strlen(price_in_str) > 0 && atof(price_in_str) > 0)
+                                             ? atof(price_in_str) : lowest;
+
+                        strncpy(ret_txn.item_sku[ret_txn.item_count], sku_in, NAME_LEN - 1);
+                        ret_txn.item_price[ret_txn.item_count] = refund_price;
+                        ret_txn.qty[ret_txn.item_count] = -qty_in;
+                        ret_txn.total += refund_price * (-qty_in);
+                        ret_txn.item_count++;
+                    } else {
+                        show_error_dialog("Maximum items reached for this transaction.");
+                    }
+                }
+                gtk_widget_destroy(add_dlg);
+
+            } else if (resp2 == 2) { // Process Refund
+                if (ret_txn.item_count == 0) {
+                    show_error_dialog("No items to return. Add items first.");
+                    continue;
+                }
+                done_ret = 1;
+            } else { // Cancel
+                gtk_widget_destroy(ret_edit);
+                return;
+            }
+        }
+        gtk_widget_destroy(ret_edit);
+
+        // === STEP 5: Refund payment dialog ===
+        GtkWidget *refund_dlg = gtk_dialog_new_with_buttons("Process Refund",
+                                                            GTK_WINDOW(main_window),
+                                                            GTK_DIALOG_MODAL,
+                                                            "_Complete Return", 1,
+                                                            "_Cancel", GTK_RESPONSE_CANCEL,
+                                                            NULL);
+        GtkWidget *refund_area = gtk_dialog_get_content_area(GTK_DIALOG(refund_dlg));
+        GtkWidget *refund_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+        gtk_container_set_border_width(GTK_CONTAINER(refund_box), 10);
+        gtk_container_add(GTK_CONTAINER(refund_area), refund_box);
+
+        char refund_total_str[64];
+        sprintf(refund_total_str, "Refund Amount: ($%.2f)", -ret_txn.total);
+        gtk_box_pack_start(GTK_BOX(refund_box), gtk_label_new(refund_total_str), FALSE, FALSE, 0);
+
+        GtkWidget *refund_type_combo = gtk_combo_box_text_new();
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(refund_type_combo), "Cash");
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(refund_type_combo), "Credit Card");
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(refund_type_combo), "In-Store Credit (Gift Card)");
+        gtk_combo_box_set_active(GTK_COMBO_BOX(refund_type_combo), 0);
+        gtk_box_pack_start(GTK_BOX(refund_box), gtk_label_new("Refund Method:"), FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(refund_box), refund_type_combo, FALSE, FALSE, 0);
+
+        gtk_box_pack_start(GTK_BOX(refund_box),
+            gtk_label_new("Note: Debit payments must be refunded as Credit.\n"
+                          "Card issuers may take up to 14 business days to process."),
+            FALSE, FALSE, 5);
+
+        gtk_widget_show_all(refund_dlg);
+
+        if (gtk_dialog_run(GTK_DIALOG(refund_dlg)) == 1) { // Complete Return
+            int ptype = gtk_combo_box_get_active(GTK_COMBO_BOX(refund_type_combo));
+            ret_txn.payment_type = (ptype == 2) ? PAYMENT_GIFT : (ptype == 1 ? PAYMENT_CREDIT : PAYMENT_CASH);
+            ret_txn.amount_paid = ret_txn.total; // refund = total (negative)
+
+            // Set date
+            time_t now = time(NULL);
+            struct tm *tm_info = localtime(&now);
+            strftime(ret_txn.date, NAME_LEN, "%Y-%m-%d %H:%M", tm_info);
+
+            // Re-add returned items to inventory
+            for (int i = 0; i < ret_txn.item_count; i++) {
+                for (int j = 0; j < s->product_count; j++) {
+                    if (strcmp(s->products[j].sku, ret_txn.item_sku[i]) == 0) {
+                        s->products[j].stock += (-ret_txn.qty[i]); // qty is negative; negate it
+                        break;
+                    }
+                }
+            }
+
+            // Deduct returned amount from sales_to_date
+            s->sales_to_date += ret_txn.total; // total is negative, so this subtracts
+
+            // Save return transaction
+            s->sales[s->sales_count++] = ret_txn;
+            s->transactions++;
+
+            char done_msg[256];
+            sprintf(done_msg, "Return Completed!\n\nTransaction ID: %s\nRefund: ($%.2f)\n\nItems have been re-added to inventory.",
+                    ret_txn.transaction_id, -ret_txn.total);
+            show_info_dialog(done_msg);
+            save_data();
+        }
+
+        gtk_widget_destroy(refund_dlg);
+    }
+
 static void complete_sale_dialog(void) {
+
     int si = choose_store_index();
     if (si < 0) return;
     Store *s = &stores[si];
