@@ -239,6 +239,15 @@ static void on_refresh_time_clock_clicked(GtkButton *button, gpointer data);
 static void time_clock_report_dialog(void);
 static void refresh_time_clock_report(GtkWidget *dialog);
 static void on_refresh_time_clock_report_clicked(GtkButton *button, gpointer data);
+static void on_export_time_clock_report_clicked(GtkButton *button, gpointer data);
+static void daily_sales_payment_report_dialog(void);
+static void refresh_daily_sales_payment_report(GtkWidget *dialog);
+static void on_refresh_daily_sales_payment_report_clicked(GtkButton *button, gpointer data);
+static void on_export_daily_sales_payment_report_clicked(GtkButton *button, gpointer data);
+static void low_stock_report_dialog(void);
+static void on_export_low_stock_report_clicked(GtkButton *button, gpointer data);
+static void best_selling_items_report_dialog(void);
+static void instructions_reference_dialog(void);
 static void work_order_defaults_dialog(void);
 static void ordering_serial_prompt_dialog(void);
 static int prompt_for_serial_number_dialog(const char *title, const char *context, char *out_serial, size_t out_size);
@@ -637,6 +646,28 @@ static void show_main_menu(void) {
     g_signal_connect(time_clock_report_item, "activate", G_CALLBACK(time_clock_report_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), time_clock_report_item);
 
+    GtkWidget *daily_sales_item = gtk_menu_item_new_with_label("Daily Sales + Payment Breakdown");
+    g_signal_connect(daily_sales_item, "activate", G_CALLBACK(daily_sales_payment_report_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), daily_sales_item);
+
+    GtkWidget *low_stock_item = gtk_menu_item_new_with_label("Low Stock");
+    g_signal_connect(low_stock_item, "activate", G_CALLBACK(low_stock_report_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), low_stock_item);
+
+    GtkWidget *best_sellers_item = gtk_menu_item_new_with_label("Best-Selling Items");
+    g_signal_connect(best_sellers_item, "activate", G_CALLBACK(best_selling_items_report_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(reports_menu), best_sellers_item);
+
+    // Help menu
+    GtkWidget *help_menu = gtk_menu_new();
+    GtkWidget *help_item = gtk_menu_item_new_with_label("Help");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(help_item), help_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), help_item);
+
+    GtkWidget *instructions_item = gtk_menu_item_new_with_label("Instructions Reference");
+    g_signal_connect(instructions_item, "activate", G_CALLBACK(instructions_reference_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(help_menu), instructions_item);
+
     // Title bar
     GtkWidget *title_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_box_pack_start(GTK_BOX(vbox), title_box, FALSE, FALSE, 0);
@@ -645,6 +676,10 @@ static void show_main_menu(void) {
     GtkWidget *title = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(title), "<span size='large' weight='bold'>Ascend Retail Platform</span>");
     gtk_box_pack_start(GTK_BOX(title_box), title, FALSE, FALSE, 15);
+
+    GtkWidget *instructions_btn = gtk_button_new_with_label("Instructions Reference");
+    g_signal_connect(instructions_btn, "clicked", G_CALLBACK(instructions_reference_dialog), NULL);
+    gtk_box_pack_end(GTK_BOX(title_box), instructions_btn, FALSE, FALSE, 10);
 
     // Desktop canvas
     desktop_canvas = gtk_drawing_area_new();
@@ -727,6 +762,75 @@ static void on_add_tax_exception_clicked(GtkToolButton *button, gpointer data) {
         }
     }
 
+    gtk_widget_destroy(dialog);
+}
+
+static void instructions_reference_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Instructions Reference",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *top_note = gtk_label_new("Quick Reference + Search Tips\nUse Ctrl/Cmd+F in PROGRAM_INSTRUCTIONS.md for full indexed documentation.");
+    gtk_label_set_line_wrap(GTK_LABEL(top_note), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), top_note, FALSE, FALSE, 0);
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(sw, 760, 430);
+    gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
+
+    GtkWidget *text_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+    gtk_container_add(GTK_CONTAINER(sw), text_view);
+
+    const char *quick_ref =
+        "ASCEND-CLONE INSTRUCTIONS REFERENCE\n\n"
+        "FULL DOC FILE\n"
+        "- PROGRAM_INSTRUCTIONS.md\n"
+        "- Includes complete step-by-step workflows, quick refs, and A-Z index\n\n"
+        "TOP MENU PATHS\n"
+        "- View > Layaways\n"
+        "- View > Special Ordered Items\n"
+        "- View > Customer Tax Exceptions\n"
+        "- View > Time Clock\n"
+        "- Options > Sales and Returns > Work Order Defaults\n"
+        "- Options > Ordering\n"
+        "- Reports > Time Clock\n"
+        "- Reports > Daily Sales + Payment Breakdown\n"
+        "- Reports > Low Stock\n"
+        "- Reports > Best-Selling Items\n"
+        "- Help > Instructions Reference\n\n"
+        "KEY WORKFLOWS\n"
+        "- Sales: Use Sales tile, add items, take payment, print receipt\n"
+        "- Returns: Use Return tile, lookup prior transaction, process refund\n"
+        "- Layaway: Use Layaway tile, save open or apply partial payment\n"
+        "- Special Orders: Reorder List > mark ordered, then mark received\n"
+        "- Time Clock: Add/Modify/Remove/Restore, filter by date, show hidden\n\n"
+        "CSV EXPORTS\n"
+        "- time_clock_report.csv\n"
+        "- daily_sales_payment_report.csv\n"
+        "- low_stock_report.csv\n\n"
+        "TIME CLOCK ALERTS\n"
+        "- Missing clock-out highlighted in Time Clock report\n"
+        "- Long shift highlighted for shifts >= 10 hours\n\n"
+        "SEARCH KEYWORDS\n"
+        "sales, returns, layaway, special order, reorder, receiving, serial,\n"
+        "time clock, long shift, missing clock-out, tax exceptions, low stock,\n"
+        "best-selling, payment breakdown, export csv, options, reports\n\n"
+        "TIP\n"
+        "- Open PROGRAM_INSTRUCTIONS.md and use Cmd+F for full keyword index and tags.\n";
+
+    GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+    gtk_text_buffer_set_text(buf, quick_ref, -1);
+
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
 }
 
@@ -1215,8 +1319,29 @@ static void time_clock_report_dialog(void) {
     gtk_box_pack_start(GTK_BOX(filter_box), gtk_label_new("To (YYYY-MM-DD):"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(filter_box), to_entry, FALSE, FALSE, 0);
 
+    GtkWidget *user_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(user_combo), "All Employees");
+    for (int i = 0; i < time_clock_count; i++) {
+        int exists = 0;
+        for (int j = 0; j < i; j++) {
+            if (strcmp(time_clock_entries[i].user_name, time_clock_entries[j].user_name) == 0) {
+                exists = 1;
+                break;
+            }
+        }
+        if (!exists && strlen(time_clock_entries[i].user_name) > 0) {
+            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(user_combo), time_clock_entries[i].user_name);
+        }
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(user_combo), 0);
+    gtk_box_pack_start(GTK_BOX(filter_box), gtk_label_new("Employee:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(filter_box), user_combo, FALSE, FALSE, 0);
+
     GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh");
     gtk_box_pack_start(GTK_BOX(filter_box), refresh_btn, FALSE, FALSE, 0);
+
+    GtkWidget *export_btn = gtk_button_new_with_label("Export CSV");
+    gtk_box_pack_start(GTK_BOX(filter_box), export_btn, FALSE, FALSE, 0);
 
     GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
@@ -1229,8 +1354,10 @@ static void time_clock_report_dialog(void) {
     g_object_set_data(G_OBJECT(dialog), "time_clock_report_from", from_entry);
     g_object_set_data(G_OBJECT(dialog), "time_clock_report_to", to_entry);
     g_object_set_data(G_OBJECT(dialog), "time_clock_report_text", text_view);
+    g_object_set_data(G_OBJECT(dialog), "time_clock_report_user_combo", user_combo);
 
     g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_time_clock_report_clicked), dialog);
+    g_signal_connect(export_btn, "clicked", G_CALLBACK(on_export_time_clock_report_clicked), dialog);
 
     refresh_time_clock_report(dialog);
 
@@ -1248,17 +1375,23 @@ static void refresh_time_clock_report(GtkWidget *dialog) {
     GtkWidget *from_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_report_from"));
     GtkWidget *to_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_report_to"));
     GtkWidget *text_view = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_report_text"));
-    if (!from_entry || !to_entry || !text_view) return;
+    GtkWidget *user_combo = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_report_user_combo"));
+    if (!from_entry || !to_entry || !text_view || !user_combo) return;
 
     const char *from_date = gtk_entry_get_text(GTK_ENTRY(from_entry));
     const char *to_date = gtk_entry_get_text(GTK_ENTRY(to_entry));
+    gchar *selected_user = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(user_combo));
+    int filter_all_users = (!selected_user || strcmp(selected_user, "All Employees") == 0);
     double total_hours = 0.0;
+    int missing_clock_out_count = 0;
+    int long_shift_count = 0;
     char report[12000] = "TIME CLOCK REPORT\n\n";
     char line[256];
 
     for (int i = 0; i < time_clock_count; i++) {
         TimeClockEntry *e = &time_clock_entries[i];
         if (e->hidden) continue;
+        if (!filter_all_users && strcmp(e->user_name, selected_user) != 0) continue;
         char entry_date[11] = "";
         strncpy(entry_date, e->start_time, 10);
         entry_date[10] = '\0';
@@ -1267,19 +1400,402 @@ static void refresh_time_clock_report(GtkWidget *dialog) {
 
         double h = compute_time_clock_hours(e);
         if (e->has_end_time) {
-            sprintf(line, "%s | %s -> %s | %.2f hrs\n", e->user_name, e->start_time, e->end_time, h);
+            if (h >= 10.0) {
+                sprintf(line, "%s | %s -> %s | %.2f hrs | ALERT: Long shift\n", e->user_name, e->start_time, e->end_time, h);
+                long_shift_count++;
+            } else {
+                sprintf(line, "%s | %s -> %s | %.2f hrs\n", e->user_name, e->start_time, e->end_time, h);
+            }
             total_hours += h;
         } else {
-            sprintf(line, "%s | %s -> (Still Working)\n", e->user_name, e->start_time);
+            sprintf(line, "%s | %s -> (Still Working) | ALERT: Missing clock-out\n", e->user_name, e->start_time);
+            missing_clock_out_count++;
         }
         strncat(report, line, sizeof(report) - strlen(report) - 1);
     }
 
     sprintf(line, "\nTotal Closed-Shift Hours: %.2f\n", total_hours);
     strncat(report, line, sizeof(report) - strlen(report) - 1);
+    sprintf(line, "Long Shifts (>=10h): %d\nMissing Clock-Outs: %d\n", long_shift_count, missing_clock_out_count);
+    strncat(report, line, sizeof(report) - strlen(report) - 1);
 
     GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
     gtk_text_buffer_set_text(buf, report, -1);
+    if (selected_user) g_free(selected_user);
+}
+
+static void on_export_time_clock_report_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    GtkWidget *dialog = GTK_WIDGET(data);
+    GtkWidget *from_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_report_from"));
+    GtkWidget *to_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_report_to"));
+    GtkWidget *user_combo = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "time_clock_report_user_combo"));
+    if (!from_entry || !to_entry || !user_combo) return;
+
+    const char *from_date = gtk_entry_get_text(GTK_ENTRY(from_entry));
+    const char *to_date = gtk_entry_get_text(GTK_ENTRY(to_entry));
+    gchar *selected_user = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(user_combo));
+    int filter_all_users = (!selected_user || strcmp(selected_user, "All Employees") == 0);
+
+    FILE *f = fopen("time_clock_report.csv", "w");
+    if (!f) {
+        show_error_dialog("Unable to export time clock CSV.");
+        return;
+    }
+
+    fprintf(f, "User,Start Time,End Time,Hours,Alert\n");
+    for (int i = 0; i < time_clock_count; i++) {
+        TimeClockEntry *e = &time_clock_entries[i];
+        if (e->hidden) continue;
+        if (!filter_all_users && strcmp(e->user_name, selected_user) != 0) continue;
+        char entry_date[11] = "";
+        strncpy(entry_date, e->start_time, 10);
+        entry_date[10] = '\0';
+        if (strlen(from_date) >= 10 && strcmp(entry_date, from_date) < 0) continue;
+        if (strlen(to_date) >= 10 && strcmp(entry_date, to_date) > 0) continue;
+
+        if (e->has_end_time) {
+            double hours = compute_time_clock_hours(e);
+            if (hours >= 10.0) {
+                fprintf(f, "%s,%s,%s,%.2f,Long shift\n", e->user_name, e->start_time, e->end_time, hours);
+            } else {
+                fprintf(f, "%s,%s,%s,%.2f,\n", e->user_name, e->start_time, e->end_time, hours);
+            }
+        } else {
+            fprintf(f, "%s,%s,(Still Working),0.00,Missing clock-out\n", e->user_name, e->start_time);
+        }
+    }
+    fclose(f);
+    if (selected_user) g_free(selected_user);
+    show_info_dialog("Exported time clock report to time_clock_report.csv");
+}
+
+static void on_refresh_daily_sales_payment_report_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    refresh_daily_sales_payment_report(GTK_WIDGET(data));
+}
+
+static void on_export_daily_sales_payment_report_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    GtkWidget *dialog = GTK_WIDGET(data);
+    GtkWidget *from_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "daily_sales_from"));
+    GtkWidget *to_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "daily_sales_to"));
+    gint si = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(dialog), "daily_sales_store_idx"));
+    if (!from_entry || !to_entry || si < 0 || si >= store_count) return;
+
+    Store *s = &stores[si];
+    const char *from_date = gtk_entry_get_text(GTK_ENTRY(from_entry));
+    const char *to_date = gtk_entry_get_text(GTK_ENTRY(to_entry));
+
+    double revenue = 0.0;
+    double cash_total = 0.0;
+    double card_total = 0.0;
+    double debit_total = 0.0;
+    double gift_total = 0.0;
+    int sale_count = 0;
+
+    for (int i = 0; i < s->sales_count; i++) {
+        Transaction *txn = &s->sales[i];
+        if (txn->status == 0) continue;
+        if (strlen(txn->date) < 10) continue;
+
+        char txn_date[11] = "";
+        strncpy(txn_date, txn->date, 10);
+        txn_date[10] = '\0';
+        if (strlen(from_date) >= 10 && strcmp(txn_date, from_date) < 0) continue;
+        if (strlen(to_date) >= 10 && strcmp(txn_date, to_date) > 0) continue;
+
+        sale_count++;
+        revenue += txn->total;
+        if (txn->payment_type == PAYMENT_CASH) cash_total += txn->total;
+        else if (txn->payment_type == PAYMENT_CREDIT) card_total += txn->total;
+        else if (txn->payment_type == PAYMENT_DEBIT) debit_total += txn->total;
+        else if (txn->payment_type == PAYMENT_GIFT) gift_total += txn->total;
+    }
+
+    FILE *f = fopen("daily_sales_payment_report.csv", "w");
+    if (!f) {
+        show_error_dialog("Unable to export daily sales CSV.");
+        return;
+    }
+    fprintf(f, "Metric,Value\n");
+    fprintf(f, "Store,%s\n", s->name);
+    fprintf(f, "From Date,%s\n", from_date);
+    fprintf(f, "To Date,%s\n", to_date);
+    fprintf(f, "Transactions,%d\n", sale_count);
+    fprintf(f, "Revenue,%.2f\n", revenue);
+    fprintf(f, "Cash,%.2f\n", cash_total);
+    fprintf(f, "Card (Credit),%.2f\n", card_total);
+    fprintf(f, "Debit,%.2f\n", debit_total);
+    fprintf(f, "Store Credit / Gift,%.2f\n", gift_total);
+    fclose(f);
+
+    show_info_dialog("Exported daily sales report to daily_sales_payment_report.csv");
+}
+
+static void refresh_daily_sales_payment_report(GtkWidget *dialog) {
+    GtkWidget *from_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "daily_sales_from"));
+    GtkWidget *to_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "daily_sales_to"));
+    GtkWidget *text_view = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "daily_sales_text"));
+    gint si = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(dialog), "daily_sales_store_idx"));
+    if (!from_entry || !to_entry || !text_view || si < 0 || si >= store_count) return;
+
+    Store *s = &stores[si];
+    const char *from_date = gtk_entry_get_text(GTK_ENTRY(from_entry));
+    const char *to_date = gtk_entry_get_text(GTK_ENTRY(to_entry));
+
+    double revenue = 0.0;
+    double cash_total = 0.0;
+    double card_total = 0.0;
+    double debit_total = 0.0;
+    double gift_total = 0.0;
+    int sale_count = 0;
+
+    for (int i = 0; i < s->sales_count; i++) {
+        Transaction *txn = &s->sales[i];
+        if (txn->status == 0) continue; // skip open layaways
+        if (strlen(txn->date) < 10) continue;
+
+        char txn_date[11] = "";
+        strncpy(txn_date, txn->date, 10);
+        txn_date[10] = '\0';
+        if (strlen(from_date) >= 10 && strcmp(txn_date, from_date) < 0) continue;
+        if (strlen(to_date) >= 10 && strcmp(txn_date, to_date) > 0) continue;
+
+        sale_count++;
+        revenue += txn->total;
+        if (txn->payment_type == PAYMENT_CASH) cash_total += txn->total;
+        else if (txn->payment_type == PAYMENT_CREDIT) card_total += txn->total;
+        else if (txn->payment_type == PAYMENT_DEBIT) debit_total += txn->total;
+        else if (txn->payment_type == PAYMENT_GIFT) gift_total += txn->total;
+    }
+
+    char report[3000];
+    snprintf(report, sizeof(report),
+             "DAILY SALES + PAYMENT BREAKDOWN\n\n"
+             "Store: %s\n"
+             "Date Range: %s to %s\n\n"
+             "Transactions: %d\n"
+             "Revenue: $%.2f\n\n"
+             "Payment Breakdown:\n"
+             "Cash: $%.2f\n"
+             "Card (Credit): $%.2f\n"
+             "Debit: $%.2f\n"
+             "Store Credit / Gift: $%.2f\n",
+             s->name, from_date, to_date,
+             sale_count, revenue,
+             cash_total, card_total, debit_total, gift_total);
+
+    GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+    gtk_text_buffer_set_text(buf, report, -1);
+}
+
+static void daily_sales_payment_report_dialog(void) {
+    int si = choose_store_index();
+    if (si < 0) return;
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Daily Sales + Payment Breakdown",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *filter_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(vbox), filter_box, FALSE, FALSE, 0);
+    GtkWidget *from_entry = gtk_entry_new();
+    GtkWidget *to_entry = gtk_entry_new();
+    char today[NAME_LEN];
+    get_today_date(today, sizeof(today));
+    gtk_entry_set_text(GTK_ENTRY(from_entry), today);
+    gtk_entry_set_text(GTK_ENTRY(to_entry), today);
+    gtk_box_pack_start(GTK_BOX(filter_box), gtk_label_new("From (YYYY-MM-DD):"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(filter_box), from_entry, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(filter_box), gtk_label_new("To (YYYY-MM-DD):"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(filter_box), to_entry, FALSE, FALSE, 0);
+
+    GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh");
+    gtk_box_pack_start(GTK_BOX(filter_box), refresh_btn, FALSE, FALSE, 0);
+
+    GtkWidget *export_btn = gtk_button_new_with_label("Export CSV");
+    gtk_box_pack_start(GTK_BOX(filter_box), export_btn, FALSE, FALSE, 0);
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(sw, 680, 320);
+    gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
+    GtkWidget *text_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+    gtk_container_add(GTK_CONTAINER(sw), text_view);
+
+    g_object_set_data(G_OBJECT(dialog), "daily_sales_from", from_entry);
+    g_object_set_data(G_OBJECT(dialog), "daily_sales_to", to_entry);
+    g_object_set_data(G_OBJECT(dialog), "daily_sales_text", text_view);
+    g_object_set_data(G_OBJECT(dialog), "daily_sales_store_idx", GINT_TO_POINTER(si));
+    g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_daily_sales_payment_report_clicked), dialog);
+    g_signal_connect(export_btn, "clicked", G_CALLBACK(on_export_daily_sales_payment_report_clicked), dialog);
+
+    refresh_daily_sales_payment_report(dialog);
+
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static void low_stock_report_dialog(void) {
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Low Stock Report",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Run", GTK_RESPONSE_OK,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *threshold_entry = create_labeled_entry("Low Stock Threshold:", vbox);
+    gtk_entry_set_text(GTK_ENTRY(threshold_entry), "5");
+
+    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(vbox), button_box, FALSE, FALSE, 0);
+    GtkWidget *export_btn = gtk_button_new_with_label("Export CSV");
+    gtk_box_pack_start(GTK_BOX(button_box), export_btn, FALSE, FALSE, 0);
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(sw, 700, 320);
+    gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
+    GtkWidget *text_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+    gtk_container_add(GTK_CONTAINER(sw), text_view);
+
+    gtk_widget_show_all(dialog);
+
+    g_object_set_data(G_OBJECT(dialog), "low_stock_threshold", threshold_entry);
+    g_object_set_data(G_OBJECT(dialog), "low_stock_store_idx", GINT_TO_POINTER(si));
+    g_signal_connect(export_btn, "clicked", G_CALLBACK(on_export_low_stock_report_clicked), dialog);
+
+    int done = 0;
+    while (!done) {
+        int resp = gtk_dialog_run(GTK_DIALOG(dialog));
+        if (resp == GTK_RESPONSE_OK) {
+            int threshold = atoi(gtk_entry_get_text(GTK_ENTRY(threshold_entry)));
+            if (threshold < 0) threshold = 0;
+
+            char report[8000] = "LOW STOCK REPORT\n\n";
+            char line[256];
+            int count = 0;
+            for (int i = 0; i < s->product_count; i++) {
+                Product *p = &s->products[i];
+                if (p->stock <= threshold) {
+                    snprintf(line, sizeof(line), "%s | SKU: %s | In Stock: %d | Price: $%.2f\n", p->name, p->sku, p->stock, p->price);
+                    strncat(report, line, sizeof(report) - strlen(report) - 1);
+                    count++;
+                }
+            }
+            if (count == 0) {
+                strncat(report, "No products below threshold.\n", sizeof(report) - strlen(report) - 1);
+            }
+
+            GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+            gtk_text_buffer_set_text(buf, report, -1);
+        } else {
+            done = 1;
+        }
+    }
+
+    gtk_widget_destroy(dialog);
+}
+
+static void on_export_low_stock_report_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    GtkWidget *dialog = GTK_WIDGET(data);
+    GtkWidget *threshold_entry = GTK_WIDGET(g_object_get_data(G_OBJECT(dialog), "low_stock_threshold"));
+    gint si = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(dialog), "low_stock_store_idx"));
+    if (!threshold_entry || si < 0 || si >= store_count) return;
+
+    Store *s = &stores[si];
+    int threshold = atoi(gtk_entry_get_text(GTK_ENTRY(threshold_entry)));
+    if (threshold < 0) threshold = 0;
+
+    FILE *f = fopen("low_stock_report.csv", "w");
+    if (!f) {
+        show_error_dialog("Unable to export low stock CSV.");
+        return;
+    }
+
+    fprintf(f, "Name,SKU,In Stock,Price\n");
+    for (int i = 0; i < s->product_count; i++) {
+        Product *p = &s->products[i];
+        if (p->stock <= threshold) {
+            fprintf(f, "%s,%s,%d,%.2f\n", p->name, p->sku, p->stock, p->price);
+        }
+    }
+    fclose(f);
+
+    show_info_dialog("Exported low stock report to low_stock_report.csv");
+}
+
+static void best_selling_items_report_dialog(void) {
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Best-Selling Items",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(content_area), sw);
+    GtkWidget *text_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(text_view), FALSE);
+    gtk_container_add(GTK_CONTAINER(sw), text_view);
+
+    int idx[MAX_PRODUCTS];
+    for (int i = 0; i < s->product_count; i++) idx[i] = i;
+    for (int i = 0; i < s->product_count; i++) {
+        for (int j = i + 1; j < s->product_count; j++) {
+            if (s->products[idx[j]].sold > s->products[idx[i]].sold) {
+                int tmp = idx[i];
+                idx[i] = idx[j];
+                idx[j] = tmp;
+            }
+        }
+    }
+
+    char report[10000] = "BEST-SELLING ITEMS\n\n";
+    char line[256];
+    int shown = 0;
+    for (int i = 0; i < s->product_count; i++) {
+        Product *p = &s->products[idx[i]];
+        if (p->sold <= 0) continue;
+        snprintf(line, sizeof(line), "%d. %s | SKU: %s | Units Sold: %d | In Stock: %d\n", shown + 1, p->name, p->sku, p->sold, p->stock);
+        strncat(report, line, sizeof(report) - strlen(report) - 1);
+        shown++;
+        if (shown >= 20) break;
+    }
+    if (shown == 0) {
+        strncat(report, "No sold-item history available yet.\n", sizeof(report) - strlen(report) - 1);
+    }
+
+    GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+    gtk_text_buffer_set_text(buf, report, -1);
+
+    gtk_widget_set_size_request(dialog, 760, 420);
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
 }
 
 
