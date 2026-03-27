@@ -5,6 +5,10 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 /*
  * Ascend Retail Platform (GTK/C)
@@ -529,7 +533,7 @@ static GtkWidget *status_label; // status bar label widget
 
 typedef enum { TILE_ADD_STORE, TILE_LIST_STORES, TILE_STORE_INFO, TILE_INVENTORY, TILE_CUSTOMERS, TILE_SALES, TILE_RETURN, TILE_LAYAWAY, TILE_BUSINESS, TILE_TREND, TILE_SAVE, TILE_LOAD, TILE_EXIT } TileType;
 typedef enum { SIZE_SMALL, SIZE_WIDE, SIZE_LARGE } TileSize;
-typedef enum { COLOR_LIGHT_BLUE, COLOR_DARK_BLUE, COLOR_GREEN, COLOR_ORANGE, COLOR_SLATE } TileColor;
+typedef enum { COLOR_LIGHT_BLUE, COLOR_DARK_BLUE, COLOR_GREEN, COLOR_ORANGE, COLOR_SLATE, COLOR_TEAL, COLOR_PURPLE, COLOR_INDIGO } TileColor;
 
 typedef struct {
     TileType type;           // action bound to tile click
@@ -546,6 +550,7 @@ static int tile_count = 11; // number of configured desktop tiles
 static int desktop_locked = 1; // 1 disables tile dragging/edits
 static int tiles_initialized = 0; // one-time tile default initialization guard
 static int dragging_tile = -1; // tile index currently being dragged (-1 none)
+static int hovered_tile = -1;  // tile index under mouse cursor for hover highlight (-1 none)
 static int drag_start_x, drag_start_y; // pointer origin for current drag operation
 static GtkWidget *desktop_canvas = NULL; // drawing area for desktop tile surface
 
@@ -1854,46 +1859,145 @@ static void apply_visual_theme(ThemeMode mode) {
 
     const int dark = should_use_dark_mode(mode);
     const char *css_light =
-        "@define-color bg_main #FFFFFF;"
-        "@define-color bg_sidebar #F8F9FA;"
-        "@define-color text_primary #212529;"
-        "@define-color accent_brand #0056A4;"
-        "@define-color status_warning #FFC107;"
-        "@define-color border_color #DEE2E6;"
-        "* { font-family: 'Segoe UI', 'Helvetica Neue', sans-serif; }"
-        "window { background-color: @bg_main; color: @text_primary; }"
-        "menu, menuitem, menubar { background-color: @bg_sidebar; color: @text_primary; }"
-        "button { background: @accent_brand; color: #FFFFFF; border-radius: 6px; padding: 4px 8px; }"
-        "entry, textview, treeview { background: @bg_main; color: @text_primary; border: 1px solid @border_color; }"
-        "label { color: @text_primary; }"
-        ".warning { color: @status_warning; font-weight: 700; }"
-        ".danger, .balance-due { color: #C62828; font-weight: 700; }";
+        "* { font-family: 'Inter', 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; font-size: 13px; }"
+        "window { background-color: #F0F4F8; color: #1A202C; }"
+        "menubar { background-image: linear-gradient(to bottom, #1A3A5C, #102A48); color: white; padding: 2px 0; border-bottom: 2px solid #0A1F36; }"
+        "menubar > menuitem { color: white; padding: 6px 14px; }"
+        "menubar > menuitem:hover, menubar > menuitem:selected { background-color: rgba(255,255,255,0.18); }"
+        "menu { background-color: #1E2A3A; color: #E2E8F0; border: 1px solid #0A1828; padding: 4px 0; }"
+        "menuitem { color: #E2E8F0; padding: 7px 16px; }"
+        "menuitem:hover, menuitem:selected { background-color: #2D4A6A; color: white; }"
+        "separator { background-color: #2D3A4A; min-height: 1px; margin: 3px 0; }"
+        "button { background-image: linear-gradient(to bottom, #4A9EE7, #2B6CB0); color: white; border: none; border-radius: 8px; padding: 8px 18px; font-weight: 600; }"
+        "button:hover { background-image: linear-gradient(to bottom, #63B3ED, #3182CE); }"
+        "button:active { background-image: linear-gradient(to bottom, #1D6BAE, #1558A0); }"
+        "button:disabled { background-image: none; background-color: #CBD5E0; color: #A0AEC0; }"
+        "button.suggested-action { background-image: linear-gradient(to bottom, #38A169, #276749); color: white; }"
+        "button.suggested-action:hover { background-image: linear-gradient(to bottom, #48BB78, #38A169); }"
+        "button.destructive-action { background-image: linear-gradient(to bottom, #E53E3E, #C53030); color: white; }"
+        "button.destructive-action:hover { background-image: linear-gradient(to bottom, #FC5858, #E53E3E); }"
+        "entry { background-color: white; color: #1A202C; border: 1.5px solid #BDC6CF; border-radius: 7px; padding: 7px 12px; }"
+        "entry:focus { border-color: #4A9EE7; background-color: white; }"
+        "entry:disabled { background-color: #EDF2F7; color: #A0AEC0; }"
+        "combobox button { background-image: linear-gradient(to bottom, #FFFFFF, #EDF2F7); color: #1A202C; border: 1.5px solid #BDC6CF; border-radius: 7px; padding: 6px 10px; font-weight: normal; }"
+        "combobox button:hover { background-image: linear-gradient(to bottom, #EBF4FF, #DBEAFE); }"
+        "scrollbar { background-color: transparent; border: none; padding: 0; }"
+        "scrollbar.vertical { min-width: 10px; }"
+        "scrollbar.horizontal { min-height: 10px; }"
+        "scrollbar slider { background-color: #A8BAC9; border-radius: 5px; min-width: 6px; min-height: 6px; border: 2px solid transparent; }"
+        "scrollbar slider:hover { background-color: #718096; }"
+        ".view { background-color: white; color: #1A202C; }"
+        "treeview.view { border: 1px solid #D0D8E0; }"
+        "treeview.view:selected { background-color: #2B6CB0; color: white; }"
+        "treeview header button { background-image: linear-gradient(to bottom, #F7FAFC, #EDF2F7); color: #4A5568; border-bottom: 2px solid #CBD5E0; font-weight: 700; padding: 8px 12px; }"
+        "treeview header button:hover { background-image: linear-gradient(to bottom, #EBF8FF, #DBEAFE); }"
+        "checkbutton check, radiobutton radio { background-color: white; border: 1.5px solid #BDC6CF; border-radius: 4px; }"
+        "checkbutton check:checked, radiobutton radio:checked { background-color: #2B6CB0; border-color: #2B6CB0; }"
+        "label { color: #1A202C; }"
+        ".heading { font-weight: 700; font-size: 14px; }"
+        ".warning { color: #B7770D; font-weight: 700; }"
+        ".danger, .balance-due { color: #C53030; font-weight: 700; }"
+        ".success { color: #276749; font-weight: 700; }"
+        "#app-header { background-image: linear-gradient(to right, #0F2A4A, #1A3A5C, #0D4A8A); border-bottom: 2px solid #091F36; }"
+        "#app-header label { color: white; }"
+        "#header-title { font-size: 17px; font-weight: 800; }"
+        "#header-subtitle { font-size: 11px; color: rgba(255,255,255,0.50); }"
+        "#header-store { font-size: 12px; color: rgba(255,255,255,0.80); font-weight: 600; }"
+        "#role-badge { background-color: rgba(255,255,255,0.18); color: white; border-radius: 10px; padding: 3px 10px; font-size: 11px; font-weight: 700; }"
+        "#app-status { background-color: #1A2530; border-top: 1px solid #0A1520; }"
+        "#app-status label { color: #8899AA; font-size: 11px; }"
+        "dialog { background-color: #F7FAFC; }"
+        ".dialog-action-area { background-color: #EDF2F7; border-top: 1px solid #CBD5E0; padding: 8px 10px; }"
+        "notebook tab { background-color: #E2E8F0; color: #718096; padding: 7px 16px; border-radius: 6px 6px 0 0; }"
+        "notebook tab:checked { background-color: white; color: #1A202C; font-weight: 600; }"
+        "progressbar trough { background-color: #CBD5E0; border-radius: 5px; min-height: 8px; }"
+        "progressbar progress { background-image: linear-gradient(to right, #4A9EE7, #38A169); border-radius: 5px; }"
+        "spinbutton { background-color: white; color: #1A202C; border: 1.5px solid #BDC6CF; border-radius: 7px; }"
+        "frame border { border: 1px solid #CBD5E0; border-radius: 6px; padding: 2px; }";
 
     const char *css_dark =
-        "@define-color bg_main #121212;"
-        "@define-color bg_sidebar #1E1E1E;"
-        "@define-color text_primary #E9ECEF;"
-        "@define-color accent_brand #4A90E2;"
-        "@define-color status_warning #FFD54F;"
-        "@define-color border_color #333333;"
-        "* { font-family: 'Segoe UI', 'Helvetica Neue', sans-serif; }"
-        "window { background-color: @bg_main; color: @text_primary; }"
-        "menu, menuitem, menubar { background-color: @bg_sidebar; color: @text_primary; }"
-        "button { background: @accent_brand; color: #FFFFFF; border-radius: 6px; padding: 4px 8px; }"
-        "entry, textview, treeview { background: @bg_sidebar; color: @text_primary; border: 1px solid @border_color; }"
-        "label { color: @text_primary; }"
-        ".warning { color: @status_warning; font-weight: 700; }"
-        ".danger, .balance-due { color: #FF6B6B; text-shadow: 0 0 6px rgba(255,80,80,0.55); font-weight: 700; }";
+        /* Base */
+        "* { font-family: 'Inter', 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; font-size: 13px; }"
+        "window { background-color: #0E1117; color: #E2E4EA; }"
+        /* Menubar */
+        "menubar { background-image: linear-gradient(to bottom, #12181F, #090E14); color: #DADDE5; padding: 2px 0; border-bottom: 2px solid #03070C; }"
+        "menubar > menuitem { color: #DADDE5; padding: 6px 14px; }"
+        "menubar > menuitem:hover, menubar > menuitem:selected { background-color: rgba(255,255,255,0.10); }"
+        /* Popup menus */
+        "menu { background-color: #1A1F28; color: #D0D3DC; border: 1px solid #05090F; padding: 4px 0; }"
+        "menuitem { color: #D0D3DC; padding: 7px 16px; }"
+        "menuitem:hover, menuitem:selected { background-color: #2A3A50; color: #E8ECFF; }"
+        "separator { background-color: #252C38; min-height: 1px; margin: 3px 0; }"
+        /* Buttons */
+        "button { background-image: linear-gradient(to bottom, #3A7BD5, #2354A0); color: white; border: none; border-radius: 8px; padding: 8px 18px; font-weight: 600; }"
+        "button:hover { background-image: linear-gradient(to bottom, #4A8BE5, #2E67B5); }"
+        "button:active { background-image: linear-gradient(to bottom, #1A4F80, #0E3A60); }"
+        "button:disabled { background-image: none; background-color: #1E2430; color: #4A5060; }"
+        "button.suggested-action { background-image: linear-gradient(to bottom, #276749, #1E5038); color: white; }"
+        "button.suggested-action:hover { background-image: linear-gradient(to bottom, #38A169, #276749); }"
+        "button.destructive-action { background-image: linear-gradient(to bottom, #C53030, #9B2C2C); color: white; }"
+        "button.destructive-action:hover { background-image: linear-gradient(to bottom, #E53E3E, #C53030); }"
+        /* Entry / text fields */
+        "entry { background-color: #1C2130; color: #DADDE5; border: 1.5px solid #303A48; border-radius: 7px; padding: 7px 12px; }"
+        "entry:focus { border-color: #4A8BE5; background-color: #1F2538; }"
+        "entry:disabled { background-color: #13171E; color: #3A4050; }"
+        /* Combobox */
+        "combobox button { background-image: linear-gradient(to bottom, #1C2130, #141C28); color: #DADDE5; border: 1.5px solid #303A48; border-radius: 7px; padding: 6px 10px; font-weight: normal; }"
+        "combobox button:hover { background-image: linear-gradient(to bottom, #242E40, #1C2538); }"
+        /* Scrollbars */
+        "scrollbar { background-color: transparent; border: none; padding: 0; }"
+        "scrollbar.vertical { min-width: 10px; }"
+        "scrollbar.horizontal { min-height: 10px; }"
+        "scrollbar slider { background-color: #3A4455; border-radius: 5px; min-width: 6px; min-height: 6px; border: 2px solid transparent; }"
+        "scrollbar slider:hover { background-color: #4A5468; }"
+        /* Tree / list views */
+        ".view { background-color: #141820; color: #DADDE5; }"
+        "treeview.view { border: 1px solid #242C38; }"
+        "treeview.view:selected { background-color: #2354A0; color: white; }"
+        "treeview header button { background-image: linear-gradient(to bottom, #1C232E, #141D28); color: #8A96A8; border-bottom: 2px solid #0C1018; font-weight: 700; padding: 8px 12px; }"
+        "treeview header button:hover { background-image: linear-gradient(to bottom, #242C38, #1C2430); }"
+        /* Checkboxes/radio */
+        "checkbutton check, radiobutton radio { background-color: #1C2130; border: 1.5px solid #303A48; border-radius: 4px; }"
+        "checkbutton check:checked, radiobutton radio:checked { background-color: #2354A0; border-color: #2354A0; }"
+        /* Labels */
+        "label { color: #E2E4EA; }"
+        ".heading { font-weight: 700; font-size: 14px; }"
+        ".warning { color: #F0A500; font-weight: 700; }"
+        ".danger, .balance-due { color: #FC5858; font-weight: 700; }"
+        ".success { color: #48BB78; font-weight: 700; }"
+        /* App header */
+        "#app-header { background-image: linear-gradient(to right, #050810, #0C1220, #080F1C); border-bottom: 2px solid #020408; }"
+        "#app-header label { color: white; }"
+        "#header-title { font-size: 17px; font-weight: 800; }"
+        "#header-subtitle { font-size: 11px; color: rgba(255,255,255,0.35); }"
+        "#header-store { font-size: 12px; color: rgba(255,255,255,0.70); font-weight: 600; }"
+        "#role-badge { background-color: rgba(255,255,255,0.10); color: rgba(255,255,255,0.90); border-radius: 10px; padding: 3px 10px; font-size: 11px; font-weight: 700; }"
+        /* App status bar */
+        "#app-status { background-color: #0A0E14; border-top: 1px solid #04070C; }"
+        "#app-status label { color: #4A5A6A; font-size: 11px; }"
+        /* Dialogs */
+        "dialog { background-color: #141820; }"
+        ".dialog-action-area { background-color: #0F1318; border-top: 1px solid #1A2030; padding: 8px 10px; }"
+        /* Notebook */
+        "notebook tab { background-color: #1A2030; color: #7A8898; padding: 7px 16px; border-radius: 6px 6px 0 0; }"
+        "notebook tab:checked { background-color: #1E2638; color: #E2E4EA; font-weight: 600; }"
+        /* Progressbar */
+        "progressbar trough { background-color: #1E2638; border-radius: 5px; min-height: 8px; }"
+        "progressbar progress { background-image: linear-gradient(to right, #3A7BD5, #38A169); border-radius: 5px; }"
+        /* Spinbutton */
+        "spinbutton { background-color: #1C2130; color: #DADDE5; border: 1.5px solid #303A48; border-radius: 7px; }"
+        /* Frame */
+        "frame border { border: 1px solid #242C38; border-radius: 6px; padding: 2px; }";
 
-    gtk_css_provider_load_from_data(app_css_provider, dark ? css_dark : css_light, -1, NULL);
+    gtk_css_provider_load_from_data(app_css_provider,
+                                    dark ? css_dark : css_light, -1, NULL);
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
                                               GTK_STYLE_PROVIDER(app_css_provider),
                                               GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-
     if (main_window) {
-        if (mobile_floor_mode_enabled) gtk_window_set_default_size(GTK_WINDOW(main_window), 900, 650);
-        else gtk_window_set_default_size(GTK_WINDOW(main_window), 500, 400);
-        gtk_widget_queue_draw(main_window);
+        int w = mobile_floor_mode_enabled ? 1000 : 1160;
+        int h = mobile_floor_mode_enabled ? 700  : 720;
+        gtk_window_resize(GTK_WINDOW(main_window), w, h);
     }
 }
 
@@ -2015,29 +2119,48 @@ static void generate_product_matrix_dialog(void) {
         double price = atof(gtk_entry_get_text(GTK_ENTRY(price_entry)));
 
         int created = 0;
-        char *color_tok = strtok(color_buf, ",");
-        while (color_tok) {
-            while (*color_tok == ' ') color_tok++;
-            char size_copy[NAME_LEN * 8];
-            strncpy(size_copy, size_buf, sizeof(size_copy) - 1);
-            size_copy[sizeof(size_copy) - 1] = '\0';
-            char *size_tok = strtok(size_copy, ",");
-            while (size_tok) {
-                while (*size_tok == ' ') size_tok++;
+        if (strlen(name) == 0 || strlen(sku_prefix) == 0 || price <= 0.0) {
+            show_error_dialog("Base name, SKU prefix, and positive price are required.");
+        } else {
+            char *color_tok = strtok(color_buf, ",");
+            while (color_tok) {
+                while (*color_tok == ' ') color_tok++;
+
+                char size_buf_copy[sizeof(size_buf)];
+                strncpy(size_buf_copy, size_buf, sizeof(size_buf_copy) - 1);
+                size_buf_copy[sizeof(size_buf_copy) - 1] = '\0';
+                char *size_tok = strtok(size_buf_copy, ",");
+
+                while (size_tok) {
+                    while (*size_tok == ' ') size_tok++;
+                    if (s->product_count >= MAX_PRODUCTS) break;
+
+                    Product *p = &s->products[s->product_count++];
+                    memset(p, 0, sizeof(Product));
+                    snprintf(p->sku, NAME_LEN, "%s-%s-%s", sku_prefix, color_tok, size_tok);
+                    snprintf(p->name, NAME_LEN, "%s %s %s", name, color_tok, size_tok);
+                    strncpy(p->vendor, "Matrix", NAME_LEN - 1);
+                    strncpy(p->brand, "", NAME_LEN - 1);
+                    strncpy(p->color, color_tok, NAME_LEN - 1);
+                    strncpy(p->size, size_tok, NAME_LEN - 1);
+                    p->price = price;
+                    p->msrp = price;
+                    p->average_cost = 0.0;
+                    p->last_cost = 0.0;
+                    p->serialized = 0;
+                    p->stock = 0;
+                    p->min_on_season = 1;
+                    p->max_on_season = 4;
+                    p->min_off_season = 1;
+                    p->max_off_season = 2;
+                    created++;
+
+                    size_tok = strtok(NULL, ",");
+                }
+
                 if (s->product_count >= MAX_PRODUCTS) break;
-                Product *p = &s->products[s->product_count++];
-                memset(p, 0, sizeof(Product));
-                snprintf(p->name, sizeof(p->name), "%s %s %s", name, color_tok, size_tok);
-                snprintf(p->sku, sizeof(p->sku), "%s-%s-%s", sku_prefix, color_tok, size_tok);
-                strncpy(p->color, color_tok, NAME_LEN - 1);
-                strncpy(p->size, size_tok, NAME_LEN - 1);
-                p->price = price;
-                p->msrp = price;
-                created++;
-                size_tok = strtok(NULL, ",");
+                color_tok = strtok(NULL, ",");
             }
-            if (s->product_count >= MAX_PRODUCTS) break;
-            color_tok = strtok(NULL, ",");
         }
         if (created > 0) {
             save_data();
@@ -2058,9 +2181,8 @@ static void service_ai_estimator_dialog(void) {
     for (int i = 0; i < work_order_count; i++) {
         WorkOrder *wo = &work_orders[i];
         if (wo->hidden) continue;
-        if (wo->status == WO_PICKED_UP || wo->status == WO_COMPLETED) continue;
-        backlog_hours += wo->labor_hours;
         open_count++;
+        backlog_hours += wo->labor_hours;
     }
     double hours_per_day = 7.5;
     double days = backlog_hours / hours_per_day;
@@ -3520,38 +3642,121 @@ static int choose_store_index(void) {
 // Tile system functions
 static void get_tile_color(TileColor color, double *r, double *g, double *b) {
     switch (color) {
-        case COLOR_LIGHT_BLUE: *r = 0.68; *g = 0.85; *b = 0.90; break;
-        case COLOR_DARK_BLUE: *r = 0.20; *g = 0.40; *b = 0.60; break;
-        case COLOR_GREEN: *r = 0.56; *g = 0.73; *b = 0.56; break;
-        case COLOR_ORANGE: *r = 0.95; *g = 0.64; *b = 0.38; break;
-        case COLOR_SLATE: *r = 0.44; *g = 0.50; *b = 0.56; break;
+        case COLOR_LIGHT_BLUE:  *r = 0.25; *g = 0.52; *b = 0.78; break;
+        case COLOR_DARK_BLUE:   *r = 0.10; *g = 0.28; *b = 0.55; break;
+        case COLOR_GREEN:       *r = 0.08; *g = 0.56; *b = 0.32; break;
+        case COLOR_ORANGE:      *r = 0.88; *g = 0.42; *b = 0.08; break;
+        case COLOR_SLATE:       *r = 0.30; *g = 0.36; *b = 0.44; break;
+        case COLOR_TEAL:        *r = 0.04; *g = 0.56; *b = 0.52; break;
+        case COLOR_PURPLE:      *r = 0.46; *g = 0.18; *b = 0.68; break;
+        case COLOR_INDIGO:      *r = 0.24; *g = 0.22; *b = 0.70; break;
+        default:                *r = 0.25; *g = 0.35; *b = 0.45; break;
     }
 }
 
+static void cairo_rounded_rect(cairo_t *cr, double x, double y, double w, double h, double r) {
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, x + r,     y + r,     r, M_PI,         3.0 * M_PI / 2.0);
+    cairo_arc(cr, x + w - r, y + r,     r, 3.0 * M_PI / 2.0, 2.0 * M_PI);
+    cairo_arc(cr, x + w - r, y + h - r, r, 0.0,          M_PI / 2.0);
+    cairo_arc(cr, x + r,     y + h - r, r, M_PI / 2.0,   M_PI);
+    cairo_close_path(cr);
+}
+
 static gboolean on_desktop_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
-    cairo_set_source_rgb(cr, 0.95, 0.95, 0.95);
+    (void)user_data;
+    int canvas_w = gtk_widget_get_allocated_width(widget);
+    int canvas_h = gtk_widget_get_allocated_height(widget);
+
+    cairo_pattern_t *bg = cairo_pattern_create_linear(0, 0, canvas_w, canvas_h);
+    cairo_pattern_add_color_stop_rgb(bg, 0.0, 0.10, 0.12, 0.18);
+    cairo_pattern_add_color_stop_rgb(bg, 1.0, 0.06, 0.07, 0.11);
+    cairo_set_source(cr, bg);
     cairo_paint(cr);
+    cairo_pattern_destroy(bg);
+
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.035);
+    for (int gx = 0; gx < canvas_w; gx += 28) {
+        for (int gy = 0; gy < canvas_h; gy += 28) {
+            cairo_arc(cr, gx, gy, 1.0, 0, 2 * M_PI);
+            cairo_fill(cr);
+        }
+    }
 
     for (int i = 0; i < tile_count; i++) {
         if (!tiles[i].visible) continue;
         Tile *t = &tiles[i];
-        double r, g, b;
-        get_tile_color(t->color, &r, &g, &b);
-        cairo_set_source_rgb(cr, r, g, b);
-        cairo_rectangle(cr, t->x, t->y, t->width, t->height);
-        cairo_fill(cr);
+        double rb, gb, bb;
+        get_tile_color(t->color, &rb, &gb, &bb);
 
-        if (!desktop_locked) {
-            cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
-            cairo_set_line_width(cr, 2);
-            cairo_rectangle(cr, t->x, t->y, t->width, t->height);
-            cairo_stroke(cr);
+        double tx = (double)t->x;
+        double ty = (double)t->y;
+        double tw = (double)t->width;
+        double th = (double)t->height;
+        double radius = 11.0;
+        int is_hovered = (i == hovered_tile);
+
+        double boost = is_hovered ? 0.18 : 0.0;
+        double r1 = fmin(rb + 0.15 + boost, 1.0);
+        double g1 = fmin(gb + 0.15 + boost, 1.0);
+        double b1 = fmin(bb + 0.15 + boost, 1.0);
+        double r2 = fmax(rb * 0.70 + boost * 0.5, 0.0);
+        double g2 = fmax(gb * 0.70 + boost * 0.5, 0.0);
+        double b2 = fmax(bb * 0.70 + boost * 0.5, 0.0);
+
+        for (int s = 4; s >= 1; s--) {
+            cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.09 * s);
+            cairo_rounded_rect(cr, tx + s * 1.2, ty + s * 1.5, tw, th, radius);
+            cairo_fill(cr);
         }
 
-        cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
+        cairo_pattern_t *grad = cairo_pattern_create_linear(tx, ty, tx, ty + th);
+        cairo_pattern_add_color_stop_rgb(grad, 0.0, r1, g1, b1);
+        cairo_pattern_add_color_stop_rgb(grad, 1.0, r2, g2, b2);
+        cairo_set_source(cr, grad);
+        cairo_rounded_rect(cr, tx, ty, tw, th, radius);
+        cairo_fill(cr);
+        cairo_pattern_destroy(grad);
+
+        cairo_pattern_t *shine = cairo_pattern_create_linear(tx, ty, tx, ty + th * 0.5);
+        cairo_pattern_add_color_stop_rgba(shine, 0.0, 1.0, 1.0, 1.0, is_hovered ? 0.22 : 0.16);
+        cairo_pattern_add_color_stop_rgba(shine, 1.0, 1.0, 1.0, 1.0, 0.0);
+        cairo_set_source(cr, shine);
+        cairo_save(cr);
+        cairo_rounded_rect(cr, tx, ty, tw, th * 0.55, radius);
+        cairo_clip(cr);
+        cairo_rounded_rect(cr, tx, ty, tw, th, radius);
+        cairo_fill(cr);
+        cairo_restore(cr);
+        cairo_pattern_destroy(shine);
+
+        cairo_set_line_width(cr, desktop_locked ? 1.0 : 2.0);
+        double border_alpha = desktop_locked ? (is_hovered ? 0.45 : 0.20) : 0.80;
+        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, border_alpha);
+        cairo_rounded_rect(cr, tx + 0.5, ty + 0.5, tw - 1.0, th - 1.0, radius);
+        cairo_stroke(cr);
+
+        if (!desktop_locked) {
+            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.6);
+            for (int d = -1; d <= 1; d++) {
+                cairo_arc(cr, tx + tw / 2.0 + d * 6.0, ty + 8.0, 2.0, 0, 2 * M_PI);
+                cairo_fill(cr);
+            }
+        }
+
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-        cairo_set_font_size(cr, 12);
-        cairo_move_to(cr, t->x + 10, t->y + t->height / 2 + 5);
+        cairo_set_font_size(cr, 13.0);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, t->label, &ext);
+        double text_x = tx + (tw - ext.width) / 2.0 - ext.x_bearing;
+        double text_y = ty + (th + ext.height) / 2.0 - ext.y_bearing / 2.0;
+
+        cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.50);
+        cairo_move_to(cr, text_x + 1.0, text_y + 1.5);
+        cairo_show_text(cr, t->label);
+
+        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, is_hovered ? 1.0 : 0.93);
+        cairo_move_to(cr, text_x, text_y);
         cairo_show_text(cr, t->label);
     }
 
@@ -3590,9 +3795,27 @@ static gboolean on_desktop_button_press(GtkWidget *widget, GdkEventButton *event
 }
 
 static gboolean on_desktop_motion(GtkWidget *widget, GdkEventMotion *event, gpointer user_data) {
+    (void)user_data;
     if (dragging_tile >= 0 && !desktop_locked) {
         tiles[dragging_tile].x = event->x - drag_start_x;
         tiles[dragging_tile].y = event->y - drag_start_y;
+        gtk_widget_queue_draw(widget);
+    } else {
+        // Track hover for highlight effect
+        int new_hover = find_tile_at((int)event->x, (int)event->y);
+        if (new_hover != hovered_tile) {
+            hovered_tile = new_hover;
+            gtk_widget_queue_draw(widget);
+        }
+    }
+    return FALSE;
+}
+
+static gboolean on_desktop_leave(GtkWidget *widget, GdkEventCrossing *event, gpointer user_data) {
+    (void)event;
+    (void)user_data;
+    if (hovered_tile != -1) {
+        hovered_tile = -1;
         gtk_widget_queue_draw(widget);
     }
     return FALSE;
@@ -3605,24 +3828,41 @@ static gboolean on_desktop_button_release(GtkWidget *widget, GdkEventButton *eve
 }
 
 static void init_default_tiles(void) {
+    /*
+     * 5-column grid — 140 wide × 82 tall, 20px gaps.
+     * Row 1 (y=30):  Sales · Returns · Layaway · Inventory · Customers
+     * Row 2 (y=132): Business · Trend Chart · Store Info · List Stores · Add Store
+     * Row 3 (y=234): Save Data · Load Data · Exit
+     */
     tile_count = 13;
-    int x = 20, y = 80;
+    const int TW = 140; // tile width
+    const int TH = 82;  // tile height
+    const int GX = 20;  // horizontal gap
+    const int GY = 20;  // vertical gap
+    const int SX = 30;  // start X
+    const int SY = 30;  // start Y
+    const int DX = TW + GX; // X stride  (160)
+    const int DY = TH + GY; // Y stride  (102)
 
-    tiles[0] = (Tile){ TILE_ADD_STORE, "Add Store", x, y, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_LIGHT_BLUE, 1 };
-    tiles[1] = (Tile){ TILE_LIST_STORES, "List Stores", x + 120, y, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_LIGHT_BLUE, 1 };
-    tiles[2] = (Tile){ TILE_STORE_INFO, "Store Info", x + 240, y, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_LIGHT_BLUE, 1 };
-    tiles[3] = (Tile){ TILE_INVENTORY, "Inventory", x, y + 120, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_GREEN, 1 };
-    tiles[4] = (Tile){ TILE_CUSTOMERS, "Customers", x + 120, y + 120, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_DARK_BLUE, 1 };
-    tiles[5] = (Tile){ TILE_SALES, "Sales", x + 240, y + 120, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_ORANGE, 1 };
-        tiles[12] = (Tile){ TILE_RETURN, "Return", x + 360, y + 120, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_ORANGE, 1 };
-    tiles[6] = (Tile){ TILE_LAYAWAY, "Layaway", x, y + 240, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_ORANGE, 1 };
-    tiles[7] = (Tile){ TILE_BUSINESS, "Business", x + 120, y + 240, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_ORANGE, 1 };
-    tiles[8] = (Tile){ TILE_TREND, "Trend Chart", x + 240, y + 240, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_DARK_BLUE, 1 };
-    tiles[9] = (Tile){ TILE_SAVE, "Save Data", x, y + 360, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_SLATE, 1 };
-    tiles[10] = (Tile){ TILE_LOAD, "Load Data", x + 120, y + 360, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_SLATE, 1 };
-    tiles[11] = (Tile){ TILE_EXIT, "Exit", x + 240, y + 360, TILE_SIZE_SMALL, TILE_SIZE_SMALL, SIZE_SMALL, COLOR_LIGHT_BLUE, 1 };
+    // Row 1 — primary POS actions
+    tiles[5]  = (Tile){ TILE_SALES,      "Sales",       SX + 0*DX, SY + 0*DY, TW, TH, SIZE_SMALL, COLOR_TEAL,       1 };
+    tiles[12] = (Tile){ TILE_RETURN,     "Returns",     SX + 1*DX, SY + 0*DY, TW, TH, SIZE_SMALL, COLOR_ORANGE,     1 };
+    tiles[6]  = (Tile){ TILE_LAYAWAY,    "Layaway",     SX + 2*DX, SY + 0*DY, TW, TH, SIZE_SMALL, COLOR_PURPLE,     1 };
+    tiles[3]  = (Tile){ TILE_INVENTORY,  "Inventory",   SX + 3*DX, SY + 0*DY, TW, TH, SIZE_SMALL, COLOR_GREEN,      1 };
+    tiles[4]  = (Tile){ TILE_CUSTOMERS,  "Customers",   SX + 4*DX, SY + 0*DY, TW, TH, SIZE_SMALL, COLOR_INDIGO,     1 };
+
+    // Row 2 — management and analytics
+    tiles[7]  = (Tile){ TILE_BUSINESS,   "Business",    SX + 0*DX, SY + 1*DY, TW, TH, SIZE_SMALL, COLOR_DARK_BLUE,  1 };
+    tiles[8]  = (Tile){ TILE_TREND,      "Trend Chart", SX + 1*DX, SY + 1*DY, TW, TH, SIZE_SMALL, COLOR_DARK_BLUE,  1 };
+    tiles[2]  = (Tile){ TILE_STORE_INFO, "Store Info",  SX + 2*DX, SY + 1*DY, TW, TH, SIZE_SMALL, COLOR_LIGHT_BLUE, 1 };
+    tiles[1]  = (Tile){ TILE_LIST_STORES,"List Stores", SX + 3*DX, SY + 1*DY, TW, TH, SIZE_SMALL, COLOR_LIGHT_BLUE, 1 };
+    tiles[0]  = (Tile){ TILE_ADD_STORE,  "Add Store",   SX + 4*DX, SY + 1*DY, TW, TH, SIZE_SMALL, COLOR_LIGHT_BLUE, 1 };
+
+    // Row 3 — system actions
+    tiles[9]  = (Tile){ TILE_SAVE,       "Save Data",   SX + 0*DX, SY + 2*DY, TW, TH, SIZE_SMALL, COLOR_SLATE,      1 };
+    tiles[10] = (Tile){ TILE_LOAD,       "Load Data",   SX + 1*DX, SY + 2*DY, TW, TH, SIZE_SMALL, COLOR_SLATE,      1 };
+    tiles[11] = (Tile){ TILE_EXIT,       "Exit",        SX + 2*DX, SY + 2*DY, TW, TH, SIZE_SMALL, COLOR_SLATE,      1 };
 }
-
 static void execute_tile_action(TileType type) {
     switch (type) {
         case TILE_ADD_STORE: add_store_dialog(); break;
@@ -4034,49 +4274,20 @@ static void employee_schedule_manager_dialog(void) {
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     gtk_container_set_border_width(GTK_CONTAINER(content), 10);
 
-    // Employee selection
-    GtkWidget *employee_label = gtk_label_new("Select Employee:");
-    GtkWidget *employee_combo = gtk_combo_box_text_new();
-    for (int i = 0; i < employee_count; i++) {
-        gchar *display = g_strdup_printf("%s %s (ID:%d)", 
-                                         employees[i].first_name, 
-                                         employees[i].last_name, 
-                                         employees[i].employee_id);
-        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(employee_combo), display);
-        g_free(display);
-    }
-    gtk_combo_box_set_active(GTK_COMBO_BOX(employee_combo), 0);
-    
-    GtkWidget *select_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-    gtk_box_pack_start(GTK_BOX(select_box), employee_label, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(select_box), employee_combo, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(content), select_box, FALSE, FALSE, 0);
-
-    // Shift list
-    GtkWidget *shift_label = gtk_label_new("Assigned Shifts:");
-    gtk_box_pack_start(GTK_BOX(content), shift_label, FALSE, FALSE, 5);
-    
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    
-    GtkListStore *store = gtk_list_store_new(5, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_INT);
-    
-    // Populate shifts for selected employee (initially employee 0)
-    if (employee_count > 0) {
-        int selected_emp_id = employees[0].employee_id;
-        for (int i = 0; i < employee_schedule_count; i++) {
-            if (employee_schedules[i].employee_id == selected_emp_id) {
-                GtkTreeIter iter;
-                gtk_list_store_append(store, &iter);
-                gtk_list_store_set(store, &iter,
-                                  0, employee_schedules[i].shift_date,
-                                  1, employee_schedules[i].start_time,
-                                  2, employee_schedules[i].end_time,
-                                  3, employee_schedules[i].notes,
-                                  4, i,
-                                  -1);
-            }
-        }
+    gtk_widget_set_size_request(scroll, -1, 280);
+
+    GtkListStore *store = gtk_list_store_new(4, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    for (int i = 0; i < employee_schedule_count; i++) {
+        GtkTreeIter iter;
+        gtk_list_store_append(store, &iter);
+        gtk_list_store_set(store, &iter,
+                          0, employee_schedules[i].shift_date,
+                          1, employee_schedules[i].start_time,
+                          2, employee_schedules[i].end_time,
+                          3, employee_schedules[i].notes,
+                          -1);
     }
     
     GtkWidget *tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
@@ -4563,38 +4774,69 @@ static void show_main_menu(void) {
     g_signal_connect(instructions_item, "activate", G_CALLBACK(instructions_reference_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(help_menu), instructions_item);
 
-    // Title bar
-    GtkWidget *title_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_box_pack_start(GTK_BOX(vbox), title_box, FALSE, FALSE, 0);
-    gtk_widget_set_size_request(title_box, -1, 50);
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 14);
+    gtk_widget_set_name(header, "app-header");
+    gtk_widget_set_size_request(header, -1, 58);
+    gtk_widget_set_margin_start(header, 14);
+    gtk_widget_set_margin_end(header, 14);
+    gtk_box_pack_start(GTK_BOX(vbox), header, FALSE, FALSE, 0);
 
-    GtkWidget *title = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(title), "<span size='large' weight='bold'>Ascend Retail Platform</span>");
-    gtk_box_pack_start(GTK_BOX(title_box), title, FALSE, FALSE, 15);
+    GtkWidget *brand_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
+    GtkWidget *header_title = gtk_label_new("ASCEND");
+    GtkWidget *header_subtitle = gtk_label_new("Retail Management Platform");
+    gtk_widget_set_name(header_title, "header-title");
+    gtk_widget_set_name(header_subtitle, "header-subtitle");
+    gtk_label_set_xalign(GTK_LABEL(header_title), 0.0f);
+    gtk_label_set_xalign(GTK_LABEL(header_subtitle), 0.0f);
+    gtk_box_pack_start(GTK_BOX(brand_box), header_title, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(brand_box), header_subtitle, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header), brand_box, FALSE, FALSE, 0);
 
-    GtkWidget *instructions_btn = gtk_button_new_with_label("Instructions Reference");
+    GtkWidget *header_spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(header_spacer, TRUE);
+    gtk_box_pack_start(GTK_BOX(header), header_spacer, TRUE, TRUE, 0);
+
+    GtkWidget *store_label = gtk_label_new(NULL);
+    gtk_widget_set_name(store_label, "header-store");
+    gtk_label_set_markup(GTK_LABEL(store_label), "Store: <b>Main Store</b>");
+    gtk_box_pack_start(GTK_BOX(header), store_label, FALSE, FALSE, 0);
+
+    GtkWidget *role_badge = gtk_label_new("MANAGER");
+    gtk_widget_set_name(role_badge, "role-badge");
+    gtk_box_pack_start(GTK_BOX(header), role_badge, FALSE, FALSE, 0);
+
+    GtkWidget *instructions_btn = gtk_button_new_with_label("Help");
     g_signal_connect(instructions_btn, "clicked", G_CALLBACK(instructions_reference_dialog), NULL);
-    gtk_box_pack_end(GTK_BOX(title_box), instructions_btn, FALSE, FALSE, 10);
+    gtk_box_pack_start(GTK_BOX(header), instructions_btn, FALSE, FALSE, 0);
 
     // Desktop canvas
     desktop_canvas = gtk_drawing_area_new();
-    gtk_widget_set_size_request(desktop_canvas, 800, 500);
+    gtk_widget_set_size_request(desktop_canvas, 900, 480);
     gtk_box_pack_start(GTK_BOX(vbox), desktop_canvas, TRUE, TRUE, 0);
 
     g_signal_connect(desktop_canvas, "draw", G_CALLBACK(on_desktop_draw), NULL);
     g_signal_connect(desktop_canvas, "button-press-event", G_CALLBACK(on_desktop_button_press), NULL);
     g_signal_connect(desktop_canvas, "motion-notify-event", G_CALLBACK(on_desktop_motion), NULL);
+    g_signal_connect(desktop_canvas, "leave-notify-event", G_CALLBACK(on_desktop_leave), NULL);
     g_signal_connect(desktop_canvas, "button-release-event", G_CALLBACK(on_desktop_button_release), NULL);
 
-    gtk_widget_set_events(desktop_canvas, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
+    gtk_widget_set_events(desktop_canvas, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK | GDK_LEAVE_NOTIFY_MASK);
 
     // Status bar
     GtkWidget *status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_name(status_box, "app-status");
     gtk_box_pack_end(GTK_BOX(vbox), status_box, FALSE, FALSE, 0);
-    gtk_widget_set_size_request(status_box, -1, 30);
+    gtk_widget_set_size_request(status_box, -1, 26);
 
     status_label = gtk_label_new("Ready (Desktop Locked)");
     gtk_box_pack_start(GTK_BOX(status_box), status_label, FALSE, FALSE, 10);
+
+    GtkWidget *status_spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(status_spacer, TRUE);
+    gtk_box_pack_start(GTK_BOX(status_box), status_spacer, TRUE, TRUE, 0);
+
+    GtkWidget *version_label = gtk_label_new("Ascend v2.0");
+    gtk_box_pack_end(GTK_BOX(status_box), version_label, FALSE, FALSE, 10);
 
     gtk_widget_show_all(main_window);
 }
@@ -10850,7 +11092,7 @@ int main(int argc, char *argv[]) {
 
     main_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(main_window), "Ascend Retail Platform");
-    gtk_window_set_default_size(GTK_WINDOW(main_window), mobile_floor_mode_enabled ? 900 : 500, mobile_floor_mode_enabled ? 650 : 400);
+    gtk_window_set_default_size(GTK_WINDOW(main_window), mobile_floor_mode_enabled ? 1000 : 1160, mobile_floor_mode_enabled ? 700 : 720);
     g_signal_connect(main_window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
     g_signal_connect(main_window, "key-press-event", G_CALLBACK(on_main_window_key_press), NULL);
 
