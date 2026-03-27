@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #define MAX_STORES 30
 #define MAX_PRODUCTS 50
@@ -12,6 +13,10 @@
 #define MAX_SPECIAL_ORDERS 200
 #define MAX_TAX_EXCEPTIONS 200
 #define MAX_TIME_CLOCK_ENTRIES 2000
+#define MAX_CUSTOMER_NOTES 4000
+#define MAX_WORK_ORDERS 2000
+#define MAX_AUDIT_LOGS 8000
+#define MAX_RESERVATIONS 3000
 #define NAME_LEN 64
 #define MAX_DAYS 30
 
@@ -101,7 +106,7 @@ typedef struct {
 } SpecialOrder;
 
 /* Transaction: a completed or in-progress sale record with payment tracking.
- * status: 0=open layaway, 1=completed, 2=paid in full
+ * status: 0=open layaway, 1=completed, 2=paid in full, 3=canceled layaway
  */
 typedef struct {
     char transaction_id[NAME_LEN];
@@ -152,7 +157,61 @@ typedef struct {
 typedef struct {
     int prompt_work_order_serial;
     int prompt_receiving_serial;
+    int layaway_reminder_days;
+    int layaway_grace_days;
+    double layaway_cancel_fee_percent;
+    int layaway_auto_cancel_enabled;
 } AppSettings;
+
+typedef struct {
+    int store_idx;
+    int customer_idx;
+    char date[NAME_LEN];
+    char note[NAME_LEN * 4];
+    int hidden;
+} CustomerNote;
+
+typedef enum { WO_OPEN, WO_WAITING_PARTS, WO_IN_PROGRESS, WO_COMPLETED, WO_PICKED_UP } WorkOrderStatus;
+
+typedef struct {
+    int id;
+    int store_idx;
+    int customer_idx;
+    char serial[NAME_LEN];
+    char problem[NAME_LEN * 4];
+    char assigned_mechanic[NAME_LEN];
+    WorkOrderStatus status;
+    double labor_rate;
+    double labor_hours;
+    double parts_total;
+    double labor_total;
+    double total;
+    char created_at[NAME_LEN];
+    char updated_at[NAME_LEN];
+    int hidden;
+} WorkOrder;
+
+typedef struct {
+    char timestamp[NAME_LEN];
+    char user[NAME_LEN];
+    char action[NAME_LEN];
+    char details[NAME_LEN * 4];
+    int hidden;
+} AuditLog;
+
+typedef struct {
+    int id;
+    int store_idx;
+    int customer_idx;
+    char sku[NAME_LEN];
+    int qty;
+    char expiry_date[NAME_LEN];
+    int status; // 0=active,1=fulfilled,2=canceled,3=expired
+    char created_at[NAME_LEN];
+    int hidden;
+} Reservation;
+
+typedef enum { ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MECHANIC } UserRole;
 
 typedef struct {
     char name[NAME_LEN];
@@ -181,7 +240,19 @@ static TaxExceptionReason tax_exceptions[MAX_TAX_EXCEPTIONS];
 static int tax_exception_count = 0;
 static TimeClockEntry time_clock_entries[MAX_TIME_CLOCK_ENTRIES];
 static int time_clock_count = 0;
-static AppSettings app_settings = {1, 1};
+static CustomerNote customer_notes[MAX_CUSTOMER_NOTES];
+static int customer_note_count = 0;
+static WorkOrder work_orders[MAX_WORK_ORDERS];
+static int work_order_count = 0;
+static int next_work_order_id = 1000;
+static AuditLog audit_logs[MAX_AUDIT_LOGS];
+static int audit_log_count = 0;
+static Reservation reservations[MAX_RESERVATIONS];
+static int reservation_count = 0;
+static int next_reservation_id = 5000;
+static UserRole active_user_role = ROLE_MANAGER;
+static char manager_override_pin[NAME_LEN] = "2468";
+static AppSettings app_settings = {1, 1, 7, 10, 15.0, 0};
 static GtkWidget *main_window;
 static GtkWidget *status_label;
 
@@ -211,6 +282,54 @@ static int tiles_initialized = 0;
 static int dragging_tile = -1;
 static int drag_start_x, drag_start_y;
 static GtkWidget *desktop_canvas = NULL;
+
+#define LAY_COL_SKU 0
+#define LAY_COL_DESC 1
+#define LAY_COL_PRICE 2
+#define LAY_COL_QTY 3
+#define LAY_COL_SERIAL 4
+#define LAY_COL_MSRP 5
+#define LAY_COL_LINE_TOTAL 6
+#define LAY_COL_COMMENTS 7
+#define LAY_COL_WARRANTY 8
+#define LAY_COL_COUNT 9
+
+typedef struct {
+    Store *store;
+    int store_idx;
+    int customer_idx;
+    Transaction txn;
+    int saved;
+    double subtotal;
+    double tax;
+    double shipping;
+    double discount;
+    double total;
+    double payments_total;
+    GtkWidget *dialog;
+    GtkListStore *items_store;
+    GtkListStore *payments_store;
+    GtkWidget *total_label;
+    GtkWidget *subtotal_label;
+    GtkWidget *tax_label;
+    GtkWidget *shipping_entry;
+    GtkWidget *discount_entry;
+    GtkWidget *tax_rate_combo;
+    GtkWidget *payments_label;
+    GtkWidget *balance_label;
+    GtkWidget *created_label;
+    GtkWidget *modified_label;
+    GtkWidget *created_by_label;
+    GtkWidget *transaction_id_label;
+    GtkWidget *register_status_combo;
+    GtkWidget *register_date_entry;
+    GtkWidget *barcode_entry;
+    GtkWidget *salesperson_combo;
+    GtkWidget *due_date_entry;
+    GtkWidget *status_right_label;
+    GtkListStore *notes_store;
+    GtkWidget *notes_tree;
+} LayawayWorkbenchContext;
 
 // Forward declarations
 static void show_main_menu(void);
@@ -269,6 +388,46 @@ static void send_special_order_notifications(GtkWidget *widget, gpointer data);
 static void show_trend_dialog(void);
 static void save_data(void);
 static void load_data(void);
+static void set_main_window_context_title(const char *store_name, const char *module_name, const char *context_label);
+static void reset_main_window_title(void);
+static void layaway_workbench_dialog(Store *s, int store_idx, int customer_idx);
+static void layaway_recalc_totals(LayawayWorkbenchContext *ctx);
+static void layaway_touch_modified(LayawayWorkbenchContext *ctx);
+static void on_layaway_shipping_changed(GtkEditable *editable, gpointer data);
+static void on_layaway_discount_changed(GtkEditable *editable, gpointer data);
+static void on_layaway_tax_changed(GtkComboBox *combo, gpointer data);
+static void on_layaway_cell_edited(GtkCellRendererText *renderer, gchar *path, gchar *new_text, gpointer data);
+static void on_layaway_add_row(GtkButton *button, gpointer data);
+static void on_layaway_remove_selected(GtkButton *button, gpointer data);
+static void on_layaway_add_by_barcode(GtkButton *button, gpointer data);
+static void on_layaway_add_payment(GtkButton *button, gpointer data);
+static void on_layaway_save(GtkWidget *widget, gpointer data);
+static void on_layaway_action_info(GtkWidget *widget, gpointer data);
+static void on_layaway_serial_lookup(GtkWidget *widget, gpointer data);
+static void layaway_policy_settings_dialog(GtkWidget *widget, gpointer data);
+static void on_layaway_note_add(GtkWidget *widget, gpointer data);
+static void on_layaway_note_edit(GtkWidget *widget, gpointer data);
+static void on_layaway_note_remove(GtkWidget *widget, gpointer data);
+static void refresh_customer_notes_store(LayawayWorkbenchContext *ctx);
+static int get_txn_due_date(const Transaction *txn, char *out_due, size_t out_size);
+static void set_txn_due_date(Transaction *txn, const char *due_date);
+static int days_until_date(const char *date_ymd);
+static void on_apply_layaway_rules_clicked(GtkButton *button, gpointer data);
+static void create_work_order_dialog(void);
+static void view_work_orders_dialog(void);
+static void audit_log_dialog(void);
+static void create_backup_snapshot(void);
+static void add_audit_log_entry(const char *user, const char *action, const char *details);
+static void security_permissions_dialog(void);
+static void create_reservation_dialog(void);
+static void view_reservations_dialog(void);
+static void alert_center_dialog(void);
+static int request_manager_override(const char *action_name);
+static const char *user_role_name(UserRole role);
+static int role_can_manage(void);
+static int role_can_service(void);
+static void on_work_order_update_status_clicked(GtkButton *button, gpointer data);
+static void on_work_order_add_part_clicked(GtkButton *button, gpointer data);
 static void execute_tile_action(TileType type);
 static void show_info_dialog(const char *message);
 static void show_error_dialog(const char *message);
@@ -412,6 +571,262 @@ static void show_error_dialog(const char *message) {
                                               GTK_MESSAGE_ERROR,
                                               GTK_BUTTONS_OK,
                                               "%s", message);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static void add_audit_log_entry(const char *user, const char *action, const char *details) {
+    if (audit_log_count >= MAX_AUDIT_LOGS) return;
+    AuditLog *log = &audit_logs[audit_log_count++];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    strftime(log->timestamp, sizeof(log->timestamp), "%Y-%m-%d %H:%M", tm_info);
+    strncpy(log->user, user ? user : "System", NAME_LEN - 1);
+    log->user[NAME_LEN - 1] = '\0';
+    strncpy(log->action, action ? action : "Action", NAME_LEN - 1);
+    log->action[NAME_LEN - 1] = '\0';
+    strncpy(log->details, details ? details : "", sizeof(log->details) - 1);
+    log->details[sizeof(log->details) - 1] = '\0';
+    log->hidden = 0;
+}
+
+static void audit_log_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Audit Log",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_size_request(sw, 900, 420);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
+
+    GtkListStore *store_list = gtk_list_store_new(4, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    for (int i = 0; i < audit_log_count; i++) {
+        AuditLog *a = &audit_logs[i];
+        if (a->hidden) continue;
+        GtkTreeIter iter;
+        gtk_list_store_append(store_list, &iter);
+        gtk_list_store_set(store_list, &iter,
+                           0, a->timestamp,
+                           1, a->user,
+                           2, a->action,
+                           3, a->details,
+                           -1);
+    }
+
+    GtkWidget *tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store_list));
+    GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Timestamp", renderer, "text", 0, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "User", renderer, "text", 1, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Action", renderer, "text", 2, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Details", renderer, "text", 3, NULL);
+    gtk_container_add(GTK_CONTAINER(sw), tree);
+
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static void create_backup_snapshot(void) {
+    save_data();
+
+    mkdir("backups", 0755);
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char stamp[32];
+    strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", tm_info);
+
+    char dst_path[128];
+    snprintf(dst_path, sizeof(dst_path), "backups/ascend_backup_%s.txt", stamp);
+
+    FILE *src = fopen("ascend_data.txt", "r");
+    if (!src) {
+        show_error_dialog("Backup failed: could not read ascend_data.txt");
+        return;
+    }
+    FILE *dst = fopen(dst_path, "w");
+    if (!dst) {
+        fclose(src);
+        show_error_dialog("Backup failed: could not create backup file.");
+        return;
+    }
+
+    char buffer[4096];
+    size_t n;
+    while ((n = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+        fwrite(buffer, 1, n, dst);
+    }
+    fclose(src);
+    fclose(dst);
+
+    char msg[180];
+    snprintf(msg, sizeof(msg), "Backup snapshot created: %s", dst_path);
+    add_audit_log_entry("Ascend User", "Backup", msg);
+    show_info_dialog(msg);
+}
+
+static void create_work_order_dialog(void) {
+    int si = choose_store_index();
+    if (si < 0) return;
+    Store *s = &stores[si];
+    if (s->customer_count == 0) {
+        show_error_dialog("No customers in this store. Add a customer first.");
+        return;
+    }
+    if (work_order_count >= MAX_WORK_ORDERS) {
+        show_error_dialog("Maximum work orders reached.");
+        return;
+    }
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Create Work Order",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Create", GTK_RESPONSE_OK,
+                                                   "_Cancel", GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *cust_combo = gtk_combo_box_text_new();
+    for (int i = 0; i < s->customer_count; i++) {
+        if (s->customers[i].hidden) continue;
+        char entry[NAME_LEN * 3];
+        snprintf(entry, sizeof(entry), "%s %s (%s)", s->customers[i].first_name, s->customers[i].last_name, s->customers[i].company);
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(cust_combo), entry);
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(cust_combo), 0);
+
+    GtkWidget *serial_entry = create_labeled_entry("Bike Serial:", vbox);
+    GtkWidget *problem_entry = create_labeled_entry("Problem Description:", vbox);
+    GtkWidget *mechanic_entry = create_labeled_entry("Assigned Mechanic:", vbox);
+    GtkWidget *labor_rate_entry = create_labeled_entry("Labor Rate:", vbox);
+    GtkWidget *labor_hours_entry = create_labeled_entry("Labor Hours:", vbox);
+    GtkWidget *parts_total_entry = create_labeled_entry("Parts Total:", vbox);
+
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_label_new("Customer:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), cust_combo, FALSE, FALSE, 0);
+    gtk_entry_set_text(GTK_ENTRY(labor_rate_entry), "95.00");
+    gtk_entry_set_text(GTK_ENTRY(labor_hours_entry), "1.00");
+    gtk_entry_set_text(GTK_ENTRY(parts_total_entry), "0.00");
+
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        WorkOrder *wo = &work_orders[work_order_count++];
+        memset(wo, 0, sizeof(WorkOrder));
+        wo->id = next_work_order_id++;
+        wo->store_idx = si;
+        wo->customer_idx = gtk_combo_box_get_active(GTK_COMBO_BOX(cust_combo));
+        wo->status = WO_OPEN;
+        wo->labor_rate = atof(gtk_entry_get_text(GTK_ENTRY(labor_rate_entry)));
+        wo->labor_hours = atof(gtk_entry_get_text(GTK_ENTRY(labor_hours_entry)));
+        wo->parts_total = atof(gtk_entry_get_text(GTK_ENTRY(parts_total_entry)));
+        wo->labor_total = wo->labor_rate * wo->labor_hours;
+        wo->total = wo->labor_total + wo->parts_total;
+        strncpy(wo->serial, gtk_entry_get_text(GTK_ENTRY(serial_entry)), NAME_LEN - 1);
+        wo->serial[NAME_LEN - 1] = '\0';
+        strncpy(wo->problem, gtk_entry_get_text(GTK_ENTRY(problem_entry)), sizeof(wo->problem) - 1);
+        wo->problem[sizeof(wo->problem) - 1] = '\0';
+        strncpy(wo->assigned_mechanic, gtk_entry_get_text(GTK_ENTRY(mechanic_entry)), NAME_LEN - 1);
+        wo->assigned_mechanic[NAME_LEN - 1] = '\0';
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        strftime(wo->created_at, sizeof(wo->created_at), "%Y-%m-%d %H:%M", tm_info);
+        strncpy(wo->updated_at, wo->created_at, sizeof(wo->updated_at) - 1);
+
+        char detail[256];
+        snprintf(detail, sizeof(detail), "WO-%d Store:%s Serial:%s Total:$%.2f", wo->id, s->name, wo->serial, wo->total);
+        add_audit_log_entry("Ascend User", "WorkOrderCreate", detail);
+        save_data();
+        show_info_dialog("Work order created.");
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static const char *work_order_status_name(WorkOrderStatus status) {
+    switch (status) {
+        case WO_OPEN: return "Open";
+        case WO_WAITING_PARTS: return "Waiting on Parts";
+        case WO_IN_PROGRESS: return "In Progress";
+        case WO_COMPLETED: return "Completed";
+        case WO_PICKED_UP: return "Picked Up";
+    }
+    return "Unknown";
+}
+
+static void view_work_orders_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Work Orders",
+                                                   GTK_WINDOW(main_window),
+                                                   GTK_DIALOG_MODAL,
+                                                   "_Close", GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_size_request(sw, 1000, 420);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
+
+    GtkListStore *store_list = gtk_list_store_new(8,
+                                                   G_TYPE_INT,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_STRING,
+                                                   G_TYPE_DOUBLE);
+
+    for (int i = 0; i < work_order_count; i++) {
+        WorkOrder *wo = &work_orders[i];
+        if (wo->hidden) continue;
+        char store_name[NAME_LEN] = "Unknown";
+        char customer_name[NAME_LEN * 2] = "Unknown";
+        if (wo->store_idx >= 0 && wo->store_idx < store_count) {
+            Store *s = &stores[wo->store_idx];
+            strncpy(store_name, s->name, sizeof(store_name) - 1);
+            if (wo->customer_idx >= 0 && wo->customer_idx < s->customer_count) {
+                snprintf(customer_name, sizeof(customer_name), "%s %s", s->customers[wo->customer_idx].first_name, s->customers[wo->customer_idx].last_name);
+            }
+        }
+
+        GtkTreeIter iter;
+        gtk_list_store_append(store_list, &iter);
+        gtk_list_store_set(store_list, &iter,
+                           0, wo->id,
+                           1, store_name,
+                           2, customer_name,
+                           3, wo->serial,
+                           4, work_order_status_name(wo->status),
+                           5, wo->assigned_mechanic,
+                           6, wo->created_at,
+                           7, wo->total,
+                           -1);
+    }
+
+    GtkWidget *tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store_list));
+    GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "WO #", renderer, "text", 0, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Store", renderer, "text", 1, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Customer", renderer, "text", 2, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Serial", renderer, "text", 3, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Status", renderer, "text", 4, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Mechanic", renderer, "text", 5, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Created", renderer, "text", 6, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree), -1, "Total", renderer, "text", 7, NULL);
+    gtk_container_add(GTK_CONTAINER(sw), tree);
+
+    gtk_widget_show_all(dialog);
     gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
 }
@@ -618,11 +1033,13 @@ static void on_trend_clicked(GtkButton *button, gpointer user_data) {
 
 static void on_save_clicked(GtkButton *button, gpointer user_data) {
     save_data();
+    add_audit_log_entry("Ascend User", "SaveData", "Manual save from main menu");
     show_info_dialog("Data saved successfully!");
 }
 
 static void on_load_clicked(GtkButton *button, gpointer user_data) {
     load_data();
+    add_audit_log_entry("Ascend User", "LoadData", "Manual load from main menu");
     show_info_dialog("Data loaded successfully!");
 }
 
@@ -676,6 +1093,10 @@ static void show_main_menu(void) {
     GtkWidget *time_clock_item = gtk_menu_item_new_with_label("Time Clock");
     g_signal_connect(time_clock_item, "activate", G_CALLBACK(time_clock_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), time_clock_item);
+
+    GtkWidget *work_orders_view_item = gtk_menu_item_new_with_label("Work Orders");
+    g_signal_connect(work_orders_view_item, "activate", G_CALLBACK(view_work_orders_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), work_orders_view_item);
 
     GtkWidget *desktop_menu = gtk_menu_new();
     GtkWidget *desktop_item = gtk_menu_item_new_with_label("Desktop");
@@ -784,6 +1205,24 @@ static void show_main_menu(void) {
     GtkWidget *special_orders_item = gtk_menu_item_new_with_label("Special Ordered Items");
     g_signal_connect(special_orders_item, "activate", G_CALLBACK(view_special_orders_dialog), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), special_orders_item);
+
+    // Tools menu
+    GtkWidget *tools_menu = gtk_menu_new();
+    GtkWidget *tools_item = gtk_menu_item_new_with_label("Tools");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(tools_item), tools_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), tools_item);
+
+    GtkWidget *new_work_order_item = gtk_menu_item_new_with_label("New Work Order");
+    g_signal_connect(new_work_order_item, "activate", G_CALLBACK(create_work_order_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), new_work_order_item);
+
+    GtkWidget *audit_log_item = gtk_menu_item_new_with_label("Audit Log");
+    g_signal_connect(audit_log_item, "activate", G_CALLBACK(audit_log_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), audit_log_item);
+
+    GtkWidget *backup_item = gtk_menu_item_new_with_label("Create Backup Snapshot");
+    g_signal_connect(backup_item, "activate", G_CALLBACK(create_backup_snapshot), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tools_menu), backup_item);
 
     // Reports menu
     GtkWidget *reports_menu = gtk_menu_new();
@@ -2630,9 +3069,13 @@ static void save_data(void) {
                 e->hidden);
     }
 
-        fprintf(f, "APP_SETTINGS\n%d %d\n",
+    fprintf(f, "APP_SETTINGS\n%d %d %d %d %.2f %d\n",
             app_settings.prompt_work_order_serial,
-            app_settings.prompt_receiving_serial);
+            app_settings.prompt_receiving_serial,
+            app_settings.layaway_reminder_days,
+            app_settings.layaway_grace_days,
+            app_settings.layaway_cancel_fee_percent,
+            app_settings.layaway_auto_cancel_enabled);
 
     fprintf(f, "TILE_LAYOUT\n%d\n", tile_count);
     for (int i = 0; i < tile_count; i++) {
@@ -2644,6 +3087,29 @@ static void save_data(void) {
                 tiles[i].height,
                 tiles[i].color,
                 tiles[i].visible);
+    }
+
+    fprintf(f, "CUSTOMER_NOTES\n%d\n", customer_note_count);
+    for (int i = 0; i < customer_note_count; i++) {
+        CustomerNote *n = &customer_notes[i];
+        fprintf(f, "%d %d %d\n", n->store_idx, n->customer_idx, n->hidden);
+        fprintf(f, "%s\n", n->date);
+        fprintf(f, "%s\n", n->note);
+    }
+
+    fprintf(f, "WORK_ORDERS\n%d %d\n", work_order_count, next_work_order_id);
+    for (int i = 0; i < work_order_count; i++) {
+        WorkOrder *wo = &work_orders[i];
+        fprintf(f, "%d %d %d %d\n", wo->id, wo->store_idx, wo->customer_idx, wo->status);
+        fprintf(f, "%s\n%s\n%s\n", wo->serial, wo->problem, wo->assigned_mechanic);
+        fprintf(f, "%.2f %.2f %.2f %.2f %.2f\n", wo->labor_rate, wo->labor_hours, wo->parts_total, wo->labor_total, wo->total);
+        fprintf(f, "%s\n%s\n%d\n", wo->created_at, wo->updated_at, wo->hidden);
+    }
+
+    fprintf(f, "AUDIT_LOGS\n%d\n", audit_log_count);
+    for (int i = 0; i < audit_log_count; i++) {
+        AuditLog *a = &audit_logs[i];
+        fprintf(f, "%d\n%s\n%s\n%s\n%s\n", a->hidden, a->timestamp, a->user, a->action, a->details);
     }
 
     fclose(f);
@@ -2821,8 +3287,16 @@ static void load_data(void) {
 
     tax_exception_count = 0;
     time_clock_count = 0;
+    customer_note_count = 0;
+    work_order_count = 0;
+    next_work_order_id = 1000;
+    audit_log_count = 0;
     app_settings.prompt_work_order_serial = 1;
     app_settings.prompt_receiving_serial = 1;
+    app_settings.layaway_reminder_days = 7;
+    app_settings.layaway_grace_days = 10;
+    app_settings.layaway_cancel_fee_percent = 15.0;
+    app_settings.layaway_auto_cancel_enabled = 0;
 
     if (!tiles_initialized) {
         init_default_tiles();
@@ -2886,11 +3360,31 @@ static void load_data(void) {
                 }
             }
         } else if (strcmp(section_name, "APP_SETTINGS") == 0) {
-            int work_prompt = 1;
-            int recv_prompt = 1;
-            if (fscanf(f, "%d %d\n", &work_prompt, &recv_prompt) == 2) {
-                app_settings.prompt_work_order_serial = work_prompt;
-                app_settings.prompt_receiving_serial = recv_prompt;
+            char line[256];
+            if (fscanf(f, " %255[^\n]\n", line) == 1) {
+                int work_prompt = 1;
+                int recv_prompt = 1;
+                int reminder_days = app_settings.layaway_reminder_days;
+                int grace_days = app_settings.layaway_grace_days;
+                double cancel_fee = app_settings.layaway_cancel_fee_percent;
+                int auto_cancel = app_settings.layaway_auto_cancel_enabled;
+                int rc = sscanf(line, "%d %d %d %d %lf %d",
+                                &work_prompt,
+                                &recv_prompt,
+                                &reminder_days,
+                                &grace_days,
+                                &cancel_fee,
+                                &auto_cancel);
+                if (rc >= 2) {
+                    app_settings.prompt_work_order_serial = work_prompt;
+                    app_settings.prompt_receiving_serial = recv_prompt;
+                }
+                if (rc >= 6) {
+                    app_settings.layaway_reminder_days = reminder_days;
+                    app_settings.layaway_grace_days = grace_days;
+                    app_settings.layaway_cancel_fee_percent = cancel_fee;
+                    app_settings.layaway_auto_cancel_enabled = auto_cancel;
+                }
             }
         } else if (strcmp(section_name, "TILE_LAYOUT") == 0) {
             int count = 0;
@@ -2908,6 +3402,118 @@ static void load_data(void) {
                         tiles[t].visible = visible ? 1 : 0;
                         break;
                     }
+                }
+            }
+        } else if (strcmp(section_name, "CUSTOMER_NOTES") == 0) {
+            int count = 0;
+            if (fscanf(f, "%d\n", &count) != 1) break;
+            int limit = (count < MAX_CUSTOMER_NOTES) ? count : MAX_CUSTOMER_NOTES;
+            customer_note_count = limit;
+            for (int i = 0; i < count; i++) {
+                int store_idx = 0, customer_idx = 0, hidden = 0;
+                char date_buf[NAME_LEN];
+                char note_buf[NAME_LEN * 4];
+                if (fscanf(f, "%d %d %d\n", &store_idx, &customer_idx, &hidden) != 3) break;
+                if (!fgets(date_buf, sizeof(date_buf), f)) break;
+                date_buf[strcspn(date_buf, "\n")] = '\0';
+                if (!fgets(note_buf, sizeof(note_buf), f)) break;
+                note_buf[strcspn(note_buf, "\n")] = '\0';
+                if (i < limit) {
+                    CustomerNote *n = &customer_notes[i];
+                    n->store_idx = store_idx;
+                    n->customer_idx = customer_idx;
+                    n->hidden = hidden;
+                    strncpy(n->date, date_buf, NAME_LEN - 1);
+                    n->date[NAME_LEN - 1] = '\0';
+                    strncpy(n->note, note_buf, sizeof(n->note) - 1);
+                    n->note[sizeof(n->note) - 1] = '\0';
+                }
+            }
+        } else if (strcmp(section_name, "WORK_ORDERS") == 0) {
+            int count = 0;
+            int next_id = 1000;
+            if (fscanf(f, "%d %d\n", &count, &next_id) != 2) break;
+            int limit = (count < MAX_WORK_ORDERS) ? count : MAX_WORK_ORDERS;
+            work_order_count = limit;
+            next_work_order_id = next_id;
+            for (int i = 0; i < count; i++) {
+                int id = 0, store_idx = 0, customer_idx = 0, status = 0;
+                char serial[NAME_LEN];
+                char problem[NAME_LEN * 4];
+                char mech[NAME_LEN];
+                double labor_rate = 0.0, labor_hours = 0.0, parts_total = 0.0, labor_total = 0.0, total = 0.0;
+                char created_at[NAME_LEN];
+                char updated_at[NAME_LEN];
+                int hidden = 0;
+                if (fscanf(f, "%d %d %d %d\n", &id, &store_idx, &customer_idx, &status) != 4) break;
+                if (!fgets(serial, sizeof(serial), f)) break;
+                serial[strcspn(serial, "\n")] = '\0';
+                if (!fgets(problem, sizeof(problem), f)) break;
+                problem[strcspn(problem, "\n")] = '\0';
+                if (!fgets(mech, sizeof(mech), f)) break;
+                mech[strcspn(mech, "\n")] = '\0';
+                if (fscanf(f, "%lf %lf %lf %lf %lf\n", &labor_rate, &labor_hours, &parts_total, &labor_total, &total) != 5) break;
+                if (!fgets(created_at, sizeof(created_at), f)) break;
+                created_at[strcspn(created_at, "\n")] = '\0';
+                if (!fgets(updated_at, sizeof(updated_at), f)) break;
+                updated_at[strcspn(updated_at, "\n")] = '\0';
+                if (fscanf(f, "%d\n", &hidden) != 1) break;
+
+                if (i < limit) {
+                    WorkOrder *wo = &work_orders[i];
+                    wo->id = id;
+                    wo->store_idx = store_idx;
+                    wo->customer_idx = customer_idx;
+                    wo->status = (status >= WO_OPEN && status <= WO_PICKED_UP) ? (WorkOrderStatus)status : WO_OPEN;
+                    wo->labor_rate = labor_rate;
+                    wo->labor_hours = labor_hours;
+                    wo->parts_total = parts_total;
+                    wo->labor_total = labor_total;
+                    wo->total = total;
+                    wo->hidden = hidden;
+                    strncpy(wo->serial, serial, NAME_LEN - 1);
+                    wo->serial[NAME_LEN - 1] = '\0';
+                    strncpy(wo->problem, problem, sizeof(wo->problem) - 1);
+                    wo->problem[sizeof(wo->problem) - 1] = '\0';
+                    strncpy(wo->assigned_mechanic, mech, NAME_LEN - 1);
+                    wo->assigned_mechanic[NAME_LEN - 1] = '\0';
+                    strncpy(wo->created_at, created_at, NAME_LEN - 1);
+                    wo->created_at[NAME_LEN - 1] = '\0';
+                    strncpy(wo->updated_at, updated_at, NAME_LEN - 1);
+                    wo->updated_at[NAME_LEN - 1] = '\0';
+                }
+            }
+        } else if (strcmp(section_name, "AUDIT_LOGS") == 0) {
+            int count = 0;
+            if (fscanf(f, "%d\n", &count) != 1) break;
+            int limit = (count < MAX_AUDIT_LOGS) ? count : MAX_AUDIT_LOGS;
+            audit_log_count = limit;
+            for (int i = 0; i < count; i++) {
+                int hidden = 0;
+                char timestamp[NAME_LEN];
+                char user[NAME_LEN];
+                char action[NAME_LEN];
+                char details[NAME_LEN * 4];
+                if (fscanf(f, "%d\n", &hidden) != 1) break;
+                if (!fgets(timestamp, sizeof(timestamp), f)) break;
+                timestamp[strcspn(timestamp, "\n")] = '\0';
+                if (!fgets(user, sizeof(user), f)) break;
+                user[strcspn(user, "\n")] = '\0';
+                if (!fgets(action, sizeof(action), f)) break;
+                action[strcspn(action, "\n")] = '\0';
+                if (!fgets(details, sizeof(details), f)) break;
+                details[strcspn(details, "\n")] = '\0';
+                if (i < limit) {
+                    AuditLog *a = &audit_logs[i];
+                    a->hidden = hidden;
+                    strncpy(a->timestamp, timestamp, NAME_LEN - 1);
+                    a->timestamp[NAME_LEN - 1] = '\0';
+                    strncpy(a->user, user, NAME_LEN - 1);
+                    a->user[NAME_LEN - 1] = '\0';
+                    strncpy(a->action, action, NAME_LEN - 1);
+                    a->action[NAME_LEN - 1] = '\0';
+                    strncpy(a->details, details, sizeof(a->details) - 1);
+                    a->details[sizeof(a->details) - 1] = '\0';
                 }
             }
         } else {
@@ -3477,6 +4083,1089 @@ static void create_sale_dialog(void) {
     gtk_widget_destroy(pay_dialog);
 }
 
+static int days_until_date(const char *date_ymd) {
+    int y = 0, m = 0, d = 0;
+    if (!date_ymd || sscanf(date_ymd, "%d-%d-%d", &y, &m, &d) != 3) return 999999;
+
+    time_t now = time(NULL);
+    struct tm today_tm = *localtime(&now);
+    today_tm.tm_hour = 0;
+    today_tm.tm_min = 0;
+    today_tm.tm_sec = 0;
+    time_t today_ts = mktime(&today_tm);
+
+    struct tm due_tm;
+    memset(&due_tm, 0, sizeof(due_tm));
+    due_tm.tm_year = y - 1900;
+    due_tm.tm_mon = m - 1;
+    due_tm.tm_mday = d;
+    due_tm.tm_isdst = -1;
+    time_t due_ts = mktime(&due_tm);
+    if (due_ts == (time_t)-1 || today_ts == (time_t)-1) return 999999;
+
+    double diff_days = difftime(due_ts, today_ts) / 86400.0;
+    if (diff_days >= 0) return (int)(diff_days + 0.5);
+    return (int)(diff_days - 0.5);
+}
+
+static int get_txn_due_date(const Transaction *txn, char *out_due, size_t out_size) {
+    if (!txn || !out_due || out_size < 11) return 0;
+    out_due[0] = '\0';
+    const char *marker = strstr(txn->notes, "DUE:");
+    if (!marker) return 0;
+    marker += 4;
+    if (strlen(marker) < 10) return 0;
+    strncpy(out_due, marker, 10);
+    out_due[10] = '\0';
+    return 1;
+}
+
+static void set_txn_due_date(Transaction *txn, const char *due_date) {
+    if (!txn) return;
+    if (!due_date || strlen(due_date) < 10) {
+        strncpy(txn->notes, "", sizeof(txn->notes) - 1);
+        txn->notes[sizeof(txn->notes) - 1] = '\0';
+        return;
+    }
+    char kept[NAME_LEN * 2] = "";
+    const char *pipe = strchr(txn->notes, '|');
+    if (pipe && *(pipe + 1) != '\0') {
+        strncpy(kept, pipe + 1, sizeof(kept) - 1);
+        kept[sizeof(kept) - 1] = '\0';
+    }
+    if (strlen(kept) > 0) {
+        snprintf(txn->notes, sizeof(txn->notes), "DUE:%.*s|%s", 10, due_date, kept);
+    } else {
+        snprintf(txn->notes, sizeof(txn->notes), "DUE:%.*s", 10, due_date);
+    }
+}
+
+static void refresh_customer_notes_store(LayawayWorkbenchContext *ctx) {
+    if (!ctx || !ctx->notes_store) return;
+    gtk_list_store_clear(ctx->notes_store);
+    for (int i = 0; i < customer_note_count; i++) {
+        CustomerNote *n = &customer_notes[i];
+        if (n->hidden) continue;
+        if (n->store_idx != ctx->store_idx || n->customer_idx != ctx->customer_idx) continue;
+        GtkTreeIter iter;
+        gtk_list_store_append(ctx->notes_store, &iter);
+        gtk_list_store_set(ctx->notes_store, &iter,
+                           0, n->date,
+                           1, n->note,
+                           2, i,
+                           -1);
+    }
+}
+
+static int selected_note_index(LayawayWorkbenchContext *ctx) {
+    if (!ctx || !ctx->notes_tree) return -1;
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(ctx->notes_tree));
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    if (!gtk_tree_selection_get_selected(sel, &model, &iter)) return -1;
+    int note_idx = -1;
+    gtk_tree_model_get(model, &iter, 2, &note_idx, -1);
+    return note_idx;
+}
+
+static void on_layaway_note_add(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    if (customer_note_count >= MAX_CUSTOMER_NOTES) {
+        show_error_dialog("Maximum customer notes reached.");
+        return;
+    }
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Add Customer Note",
+                                                     GTK_WINDOW(ctx->dialog),
+                                                     GTK_DIALOG_MODAL,
+                                                     "_Save", GTK_RESPONSE_OK,
+                                                     "_Cancel", GTK_RESPONSE_CANCEL,
+                                                     NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 10);
+    gtk_container_add(GTK_CONTAINER(area), box);
+
+    GtkWidget *date_entry = create_labeled_entry("Date (YYYY-MM-DD):", box);
+    GtkWidget *note_entry = create_labeled_entry("Note:", box);
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char dt[16];
+    strftime(dt, sizeof(dt), "%Y-%m-%d", tm_info);
+    gtk_entry_set_text(GTK_ENTRY(date_entry), dt);
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char *date = gtk_entry_get_text(GTK_ENTRY(date_entry));
+        const char *text = gtk_entry_get_text(GTK_ENTRY(note_entry));
+        if (strlen(text) == 0) {
+            show_error_dialog("Note text is required.");
+        } else {
+            CustomerNote *n = &customer_notes[customer_note_count++];
+            n->store_idx = ctx->store_idx;
+            n->customer_idx = ctx->customer_idx;
+            n->hidden = 0;
+            strncpy(n->date, date, NAME_LEN - 1);
+            n->date[NAME_LEN - 1] = '\0';
+            strncpy(n->note, text, sizeof(n->note) - 1);
+            n->note[sizeof(n->note) - 1] = '\0';
+            refresh_customer_notes_store(ctx);
+            layaway_touch_modified(ctx);
+            save_data();
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void on_layaway_note_edit(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    int idx = selected_note_index(ctx);
+    if (idx < 0 || idx >= customer_note_count) {
+        show_error_dialog("Select a note to edit.");
+        return;
+    }
+    CustomerNote *n = &customer_notes[idx];
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Edit Customer Note",
+                                                     GTK_WINDOW(ctx->dialog),
+                                                     GTK_DIALOG_MODAL,
+                                                     "_Save", GTK_RESPONSE_OK,
+                                                     "_Cancel", GTK_RESPONSE_CANCEL,
+                                                     NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 10);
+    gtk_container_add(GTK_CONTAINER(area), box);
+
+    GtkWidget *date_entry = create_labeled_entry("Date (YYYY-MM-DD):", box);
+    GtkWidget *note_entry = create_labeled_entry("Note:", box);
+    gtk_entry_set_text(GTK_ENTRY(date_entry), n->date);
+    gtk_entry_set_text(GTK_ENTRY(note_entry), n->note);
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char *date = gtk_entry_get_text(GTK_ENTRY(date_entry));
+        const char *text = gtk_entry_get_text(GTK_ENTRY(note_entry));
+        if (strlen(text) == 0) {
+            show_error_dialog("Note text is required.");
+        } else {
+            strncpy(n->date, date, NAME_LEN - 1);
+            n->date[NAME_LEN - 1] = '\0';
+            strncpy(n->note, text, sizeof(n->note) - 1);
+            n->note[sizeof(n->note) - 1] = '\0';
+            refresh_customer_notes_store(ctx);
+            layaway_touch_modified(ctx);
+            save_data();
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void on_layaway_note_remove(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    int idx = selected_note_index(ctx);
+    if (idx < 0 || idx >= customer_note_count) {
+        show_error_dialog("Select a note to remove.");
+        return;
+    }
+    customer_notes[idx].hidden = 1;
+    refresh_customer_notes_store(ctx);
+    layaway_touch_modified(ctx);
+    save_data();
+}
+
+static void layaway_policy_settings_dialog(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Layaway Policy Settings",
+                                                     GTK_WINDOW(ctx->dialog),
+                                                     GTK_DIALOG_MODAL,
+                                                     "_Save", GTK_RESPONSE_OK,
+                                                     "_Cancel", GTK_RESPONSE_CANCEL,
+                                                     NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 10);
+    gtk_container_add(GTK_CONTAINER(area), box);
+
+    GtkWidget *reminder_entry = create_labeled_entry("Reminder Days Before Due:", box);
+    GtkWidget *grace_entry = create_labeled_entry("Grace Days After Due:", box);
+    GtkWidget *fee_entry = create_labeled_entry("Cancellation Fee %:", box);
+    GtkWidget *auto_cancel = gtk_check_button_new_with_label("Auto-cancel overdue layaways past grace period");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(auto_cancel), app_settings.layaway_auto_cancel_enabled);
+    gtk_box_pack_start(GTK_BOX(box), auto_cancel, FALSE, FALSE, 0);
+
+    char temp[32];
+    snprintf(temp, sizeof(temp), "%d", app_settings.layaway_reminder_days);
+    gtk_entry_set_text(GTK_ENTRY(reminder_entry), temp);
+    snprintf(temp, sizeof(temp), "%d", app_settings.layaway_grace_days);
+    gtk_entry_set_text(GTK_ENTRY(grace_entry), temp);
+    snprintf(temp, sizeof(temp), "%.2f", app_settings.layaway_cancel_fee_percent);
+    gtk_entry_set_text(GTK_ENTRY(fee_entry), temp);
+
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        app_settings.layaway_reminder_days = atoi(gtk_entry_get_text(GTK_ENTRY(reminder_entry)));
+        app_settings.layaway_grace_days = atoi(gtk_entry_get_text(GTK_ENTRY(grace_entry)));
+        app_settings.layaway_cancel_fee_percent = atof(gtk_entry_get_text(GTK_ENTRY(fee_entry)));
+        app_settings.layaway_auto_cancel_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(auto_cancel));
+        if (app_settings.layaway_reminder_days < 0) app_settings.layaway_reminder_days = 0;
+        if (app_settings.layaway_grace_days < 0) app_settings.layaway_grace_days = 0;
+        if (app_settings.layaway_cancel_fee_percent < 0.0) app_settings.layaway_cancel_fee_percent = 0.0;
+        save_data();
+        show_info_dialog("Layaway policy settings saved.");
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void on_apply_layaway_rules_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    Store *s = (Store *)data;
+    if (!s) return;
+    int canceled = 0;
+    for (int i = 0; i < s->sales_count; i++) {
+        Transaction *txn = &s->sales[i];
+        if (txn->status != 0) continue;
+        char due[16];
+        if (!get_txn_due_date(txn, due, sizeof(due))) continue;
+        int days = days_until_date(due);
+        if (app_settings.layaway_auto_cancel_enabled && days < -app_settings.layaway_grace_days) {
+            txn->status = 3;
+            char extra[64];
+            snprintf(extra, sizeof(extra), "CANCEL_FEE:%.2f", app_settings.layaway_cancel_fee_percent);
+            if (!strstr(txn->notes, extra)) {
+                strncat(txn->notes, "|", sizeof(txn->notes) - strlen(txn->notes) - 1);
+                strncat(txn->notes, extra, sizeof(txn->notes) - strlen(txn->notes) - 1);
+            }
+            canceled++;
+        }
+    }
+    save_data();
+    if (canceled > 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%d layaway transaction(s) canceled by policy rules.", canceled);
+        add_audit_log_entry("System", "LayawayAutoCancel", msg);
+        show_info_dialog(msg);
+    } else {
+        show_info_dialog("No layaways met cancellation criteria.");
+    }
+}
+
+static void set_main_window_context_title(const char *store_name, const char *module_name, const char *context_label) {
+    char title[256];
+    snprintf(title, sizeof(title), "Ascend Retail Management Software - %s - [%s for %s]",
+             store_name ? store_name : "Store",
+             module_name ? module_name : "Module",
+             context_label ? context_label : "Customer");
+    gtk_window_set_title(GTK_WINDOW(main_window), title);
+}
+
+static void reset_main_window_title(void) {
+    gtk_window_set_title(GTK_WINDOW(main_window), "Ascend Retail Platform");
+}
+
+static void layaway_touch_modified(LayawayWorkbenchContext *ctx) {
+    if (!ctx || !ctx->modified_label) return;
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char dt[64];
+    strftime(dt, sizeof(dt), "%Y-%m-%d %H:%M", tm_info);
+    char line[96];
+    snprintf(line, sizeof(line), "Last Modified: %s", dt);
+    gtk_label_set_text(GTK_LABEL(ctx->modified_label), line);
+}
+
+static double layaway_get_tax_rate(LayawayWorkbenchContext *ctx) {
+    int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(ctx->tax_rate_combo));
+    if (idx == 0) return 0.00;
+    if (idx == 1) return 0.04;
+    if (idx == 2) return 0.07;
+    return 0.0825;
+}
+
+static void layaway_recalc_totals(LayawayWorkbenchContext *ctx) {
+    GtkTreeIter iter;
+    gboolean valid;
+    double subtotal = 0.0;
+
+    valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(ctx->items_store), &iter);
+    while (valid) {
+        double price = 0.0;
+        int qty = 0;
+        gtk_tree_model_get(GTK_TREE_MODEL(ctx->items_store), &iter,
+                           LAY_COL_PRICE, &price,
+                           LAY_COL_QTY, &qty,
+                           -1);
+        if (qty < 0) qty = 0;
+        double line_total = price * qty;
+        subtotal += line_total;
+        gtk_list_store_set(ctx->items_store, &iter, LAY_COL_LINE_TOTAL, line_total, -1);
+        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(ctx->items_store), &iter);
+    }
+
+    ctx->subtotal = subtotal;
+    ctx->shipping = atof(gtk_entry_get_text(GTK_ENTRY(ctx->shipping_entry)));
+    if (ctx->shipping < 0.0) ctx->shipping = 0.0;
+    ctx->discount = atof(gtk_entry_get_text(GTK_ENTRY(ctx->discount_entry)));
+    if (ctx->discount < 0.0) ctx->discount = 0.0;
+
+    ctx->tax = (ctx->subtotal - ctx->discount) * layaway_get_tax_rate(ctx);
+    if (ctx->tax < 0.0) ctx->tax = 0.0;
+    ctx->total = ctx->subtotal + ctx->tax + ctx->shipping - ctx->discount;
+    if (ctx->total < 0.0) ctx->total = 0.0;
+
+    char line[128];
+    snprintf(line, sizeof(line), "Subtotal: $%.2f", ctx->subtotal);
+    gtk_label_set_text(GTK_LABEL(ctx->subtotal_label), line);
+    snprintf(line, sizeof(line), "Tax: $%.2f", ctx->tax);
+    gtk_label_set_text(GTK_LABEL(ctx->tax_label), line);
+    snprintf(line, sizeof(line), "Total: $%.2f", ctx->total);
+    gtk_label_set_text(GTK_LABEL(ctx->total_label), line);
+    snprintf(line, sizeof(line), "Payments: $%.2f", ctx->payments_total);
+    gtk_label_set_text(GTK_LABEL(ctx->payments_label), line);
+    snprintf(line, sizeof(line), "Balance: $%.2f", ctx->total - ctx->payments_total);
+    gtk_label_set_text(GTK_LABEL(ctx->balance_label), line);
+}
+
+static void on_layaway_shipping_changed(GtkEditable *editable, gpointer data) {
+    (void)editable;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    layaway_recalc_totals(ctx);
+    layaway_touch_modified(ctx);
+}
+
+static void on_layaway_discount_changed(GtkEditable *editable, gpointer data) {
+    (void)editable;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    layaway_recalc_totals(ctx);
+    layaway_touch_modified(ctx);
+}
+
+static void on_layaway_tax_changed(GtkComboBox *combo, gpointer data) {
+    (void)combo;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    layaway_recalc_totals(ctx);
+    layaway_touch_modified(ctx);
+}
+
+static void on_layaway_cell_edited(GtkCellRendererText *renderer, gchar *path, gchar *new_text, gpointer data) {
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    GtkTreePath *tree_path = gtk_tree_path_new_from_string(path);
+    GtkTreeIter iter;
+    int col = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(renderer), "lay-col"));
+    if (!gtk_tree_model_get_iter(GTK_TREE_MODEL(ctx->items_store), &iter, tree_path)) {
+        gtk_tree_path_free(tree_path);
+        return;
+    }
+
+    if (col == LAY_COL_PRICE || col == LAY_COL_MSRP) {
+        double value = atof(new_text);
+        if (value < 0.0) value = 0.0;
+        gtk_list_store_set(ctx->items_store, &iter, col, value, -1);
+    } else if (col == LAY_COL_QTY) {
+        int qty = atoi(new_text);
+        if (qty < 0) qty = 0;
+        gtk_list_store_set(ctx->items_store, &iter, LAY_COL_QTY, qty, -1);
+    } else {
+        gtk_list_store_set(ctx->items_store, &iter, col, new_text, -1);
+    }
+
+    if (col == LAY_COL_SKU) {
+        for (int i = 0; i < ctx->store->product_count; i++) {
+            Product *p = &ctx->store->products[i];
+            if (strcmp(p->sku, new_text) == 0) {
+                gtk_list_store_set(ctx->items_store, &iter,
+                                   LAY_COL_DESC, p->name,
+                                   LAY_COL_PRICE, p->price,
+                                   LAY_COL_MSRP, p->price,
+                                   -1);
+                break;
+            }
+        }
+    }
+
+    gtk_tree_path_free(tree_path);
+    layaway_recalc_totals(ctx);
+    layaway_touch_modified(ctx);
+}
+
+static void on_layaway_add_row(GtkButton *button, gpointer data) {
+    (void)button;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    GtkTreeIter iter;
+    gtk_list_store_append(ctx->items_store, &iter);
+    gtk_list_store_set(ctx->items_store, &iter,
+                       LAY_COL_SKU, "",
+                       LAY_COL_DESC, "",
+                       LAY_COL_PRICE, 0.0,
+                       LAY_COL_QTY, 1,
+                       LAY_COL_SERIAL, "",
+                       LAY_COL_MSRP, 0.0,
+                       LAY_COL_LINE_TOTAL, 0.0,
+                       LAY_COL_COMMENTS, "",
+                       LAY_COL_WARRANTY, "",
+                       -1);
+    layaway_recalc_totals(ctx);
+    layaway_touch_modified(ctx);
+}
+
+static void on_layaway_remove_selected(GtkButton *button, gpointer data) {
+    (void)button;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    GtkWidget *tree = GTK_WIDGET(g_object_get_data(G_OBJECT(ctx->dialog), "layaway_items_tree"));
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+    GList *rows = gtk_tree_selection_get_selected_rows(sel, NULL);
+    for (GList *l = g_list_last(rows); l != NULL; l = l->prev) {
+        GtkTreeIter iter;
+        GtkTreePath *path = (GtkTreePath *)l->data;
+        if (gtk_tree_model_get_iter(GTK_TREE_MODEL(ctx->items_store), &iter, path)) {
+            gtk_list_store_remove(ctx->items_store, &iter);
+        }
+        gtk_tree_path_free(path);
+    }
+    g_list_free(rows);
+    layaway_recalc_totals(ctx);
+    layaway_touch_modified(ctx);
+}
+
+static void on_layaway_add_by_barcode(GtkButton *button, gpointer data) {
+    (void)button;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    const char *barcode = gtk_entry_get_text(GTK_ENTRY(ctx->barcode_entry));
+    if (strlen(barcode) == 0) {
+        show_error_dialog("Enter a barcode/SKU first.");
+        return;
+    }
+
+    Product *p = NULL;
+    for (int i = 0; i < ctx->store->product_count; i++) {
+        if (strcmp(ctx->store->products[i].sku, barcode) == 0) {
+            p = &ctx->store->products[i];
+            break;
+        }
+    }
+    if (!p) {
+        show_error_dialog("Barcode not found in inventory.");
+        return;
+    }
+
+    GtkTreeIter iter;
+    gtk_list_store_append(ctx->items_store, &iter);
+    gtk_list_store_set(ctx->items_store, &iter,
+                       LAY_COL_SKU, p->sku,
+                       LAY_COL_DESC, p->name,
+                       LAY_COL_PRICE, p->price,
+                       LAY_COL_QTY, 1,
+                       LAY_COL_SERIAL, "",
+                       LAY_COL_MSRP, p->price,
+                       LAY_COL_LINE_TOTAL, p->price,
+                       LAY_COL_COMMENTS, "From barcode",
+                       LAY_COL_WARRANTY, "",
+                       -1);
+    gtk_entry_set_text(GTK_ENTRY(ctx->barcode_entry), "");
+    layaway_recalc_totals(ctx);
+    layaway_touch_modified(ctx);
+}
+
+static void on_layaway_add_payment(GtkButton *button, gpointer data) {
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    const char *pay_type = (const char *)g_object_get_data(G_OBJECT(button), "pay-type");
+    if (!pay_type) pay_type = "Cash";
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Add Payment",
+                                                     GTK_WINDOW(ctx->dialog),
+                                                     GTK_DIALOG_MODAL,
+                                                     "_Apply", GTK_RESPONSE_OK,
+                                                     "_Cancel", GTK_RESPONSE_CANCEL,
+                                                     NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 10);
+    gtk_container_add(GTK_CONTAINER(area), box);
+
+    GtkWidget *amount_entry = create_labeled_entry("Amount:", box);
+    GtkWidget *type_entry = create_labeled_entry("Payment Type:", box);
+    GtkWidget *user_entry = create_labeled_entry("User Added:", box);
+    gtk_entry_set_text(GTK_ENTRY(type_entry), pay_type);
+    gtk_entry_set_text(GTK_ENTRY(user_entry), "Ascend User");
+
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        double amount = atof(gtk_entry_get_text(GTK_ENTRY(amount_entry)));
+        const char *type = gtk_entry_get_text(GTK_ENTRY(type_entry));
+        const char *user = gtk_entry_get_text(GTK_ENTRY(user_entry));
+        if (amount > 0.0) {
+            time_t now = time(NULL);
+            struct tm *tm_info = localtime(&now);
+            char dt[32];
+            strftime(dt, sizeof(dt), "%Y-%m-%d", tm_info);
+            GtkTreeIter iter;
+            gtk_list_store_append(ctx->payments_store, &iter);
+            gtk_list_store_set(ctx->payments_store, &iter,
+                               0, dt,
+                               1, amount,
+                               2, type,
+                               3, user,
+                               -1);
+            ctx->payments_total += amount;
+            layaway_recalc_totals(ctx);
+            layaway_touch_modified(ctx);
+        } else {
+            show_error_dialog("Payment amount must be greater than 0.");
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void on_layaway_action_info(GtkWidget *widget, gpointer data) {
+    (void)data;
+    const char *label = gtk_button_get_label(GTK_BUTTON(widget));
+    char msg[256];
+    snprintf(msg, sizeof(msg), "%s workflow is available in this layaway workbench and can be expanded with deeper automation.", label ? label : "Action");
+    show_info_dialog(msg);
+}
+
+static void on_layaway_serial_lookup(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Serial Lookup and Customer Serial History",
+                                                     GTK_WINDOW(ctx->dialog),
+                                                     GTK_DIALOG_MODAL,
+                                                     "_Close", GTK_RESPONSE_CLOSE,
+                                                     NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(area), vbox);
+
+    GtkWidget *search_entry = create_labeled_entry("Serial Search:", vbox);
+    GtkWidget *text = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(text), FALSE);
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_size_request(sw, 620, 260);
+    gtk_container_add(GTK_CONTAINER(sw), text);
+    gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
+
+    char report[12000] = "Customer Serial History\n\n";
+    for (int i = 0; i < ctx->store->sales_count; i++) {
+        Transaction *t = &ctx->store->sales[i];
+        if (t->customer_idx != ctx->customer_idx) continue;
+        for (int j = 0; j < t->item_count; j++) {
+            if (strlen(t->so_comments[j]) == 0) continue;
+            char line[256];
+            snprintf(line, sizeof(line), "%s | %s | %s\n", t->transaction_id, t->item_sku[j], t->so_comments[j]);
+            strncat(report, line, sizeof(report) - strlen(report) - 1);
+        }
+    }
+
+    strncat(report, "\nOwnership Timeline (search by serial in box above, then close):\n", sizeof(report) - strlen(report) - 1);
+
+    GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text));
+    gtk_text_buffer_set_text(buf, report, -1);
+
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_CLOSE) {
+        const char *search = gtk_entry_get_text(GTK_ENTRY(search_entry));
+        if (search && strlen(search) > 0) {
+            char timeline[9000] = "Serial Ownership Timeline\n\n";
+            int hits = 0;
+            for (int i = 0; i < ctx->store->sales_count; i++) {
+                Transaction *t = &ctx->store->sales[i];
+                for (int j = 0; j < t->item_count; j++) {
+                    if (strcmp(t->so_comments[j], search) != 0) continue;
+                    char customer_name[NAME_LEN * 2] = "Unknown";
+                    if (t->customer_idx >= 0 && t->customer_idx < ctx->store->customer_count) {
+                        Customer *cust = &ctx->store->customers[t->customer_idx];
+                        snprintf(customer_name, sizeof(customer_name), "%s %s", cust->first_name, cust->last_name);
+                    }
+                    const char *action = t->is_return ? "RETURNED" : "PURCHASED";
+                    char line[300];
+                    snprintf(line, sizeof(line), "%s | %s | %s | %s | SKU:%s\n",
+                             strlen(t->date) > 0 ? t->date : "(no date)",
+                             customer_name,
+                             action,
+                             t->transaction_id,
+                             t->item_sku[j]);
+                    strncat(timeline, line, sizeof(timeline) - strlen(timeline) - 1);
+                    hits++;
+                }
+            }
+            if (hits == 0) {
+                show_info_dialog("No matching serial found in history.");
+            } else {
+                GtkWidget *timeline_dialog = gtk_dialog_new_with_buttons("Serial Ownership Timeline",
+                                                                          GTK_WINDOW(ctx->dialog),
+                                                                          GTK_DIALOG_MODAL,
+                                                                          "_Close", GTK_RESPONSE_CLOSE,
+                                                                          NULL);
+                GtkWidget *area2 = gtk_dialog_get_content_area(GTK_DIALOG(timeline_dialog));
+                GtkWidget *tv = gtk_text_view_new();
+                gtk_text_view_set_editable(GTK_TEXT_VIEW(tv), FALSE);
+                GtkWidget *sw2 = gtk_scrolled_window_new(NULL, NULL);
+                gtk_widget_set_size_request(sw2, 700, 300);
+                gtk_container_add(GTK_CONTAINER(sw2), tv);
+                gtk_container_add(GTK_CONTAINER(area2), sw2);
+                GtkTextBuffer *tb = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tv));
+                gtk_text_buffer_set_text(tb, timeline, -1);
+                gtk_widget_show_all(timeline_dialog);
+                gtk_dialog_run(GTK_DIALOG(timeline_dialog));
+                gtk_widget_destroy(timeline_dialog);
+            }
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void on_layaway_save(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
+    if (ctx->saved) {
+        show_info_dialog("This layaway transaction is already saved.");
+        return;
+    }
+    if (ctx->store->sales_count >= MAX_TRANSACTIONS) {
+        show_error_dialog("Maximum transactions reached for this store.");
+        return;
+    }
+
+    memset(&ctx->txn, 0, sizeof(Transaction));
+    ctx->txn.customer_idx = ctx->customer_idx;
+    ctx->txn.status = 0;
+    ctx->txn.total = ctx->total;
+    ctx->txn.amount_paid = ctx->payments_total;
+    ctx->txn.item_count = 0;
+    ctx->txn.payment_type = PAYMENT_CASH;
+    snprintf(ctx->txn.transaction_id, sizeof(ctx->txn.transaction_id), "LAY-%d-%ld", ctx->store_idx, (long)time(NULL) % 100000);
+
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(ctx->items_store), &iter);
+    while (valid && ctx->txn.item_count < MAX_PRODUCTS) {
+        char *sku = NULL;
+        char *serial = NULL;
+        double price = 0.0;
+        int qty = 0;
+        gtk_tree_model_get(GTK_TREE_MODEL(ctx->items_store), &iter,
+                           LAY_COL_SKU, &sku,
+                           LAY_COL_SERIAL, &serial,
+                           LAY_COL_PRICE, &price,
+                           LAY_COL_QTY, &qty,
+                           -1);
+        if (sku && strlen(sku) > 0 && qty > 0) {
+            int idx = ctx->txn.item_count;
+            strncpy(ctx->txn.item_sku[idx], sku, NAME_LEN - 1);
+            ctx->txn.item_sku[idx][NAME_LEN - 1] = '\0';
+            ctx->txn.item_price[idx] = price;
+            ctx->txn.qty[idx] = qty;
+            if (serial && strlen(serial) > 0) {
+                strncpy(ctx->txn.so_comments[idx], serial, NAME_LEN - 1);
+                ctx->txn.so_comments[idx][NAME_LEN - 1] = '\0';
+            }
+            ctx->txn.item_count++;
+        }
+        if (sku) g_free(sku);
+        if (serial) g_free(serial);
+        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(ctx->items_store), &iter);
+    }
+
+    if (ctx->txn.item_count == 0) {
+        show_error_dialog("Add at least one valid item before saving layaway.");
+        return;
+    }
+
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    strftime(ctx->txn.date, NAME_LEN, "%Y-%m-%d %H:%M", tm_info);
+    ctx->txn.print_receipt = 0;
+
+    const char *due_date = gtk_entry_get_text(GTK_ENTRY(ctx->due_date_entry));
+    set_txn_due_date(&ctx->txn, due_date);
+    int days_to_due = days_until_date(due_date);
+
+    ctx->store->sales[ctx->store->sales_count++] = ctx->txn;
+    ctx->store->transactions++;
+    ctx->saved = 1;
+    save_data();
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "Layaway saved.\n\nTransaction: %s\nTotal: $%.2f\nPayments: $%.2f\nBalance: $%.2f",
+             ctx->txn.transaction_id, ctx->total, ctx->payments_total, ctx->total - ctx->payments_total);
+    if (days_to_due <= app_settings.layaway_reminder_days) {
+        strncat(msg, "\n\nReminder: due date is approaching based on policy settings.", sizeof(msg) - strlen(msg) - 1);
+    }
+    {
+        char details[200];
+        snprintf(details, sizeof(details), "Txn:%s Store:%s Total:$%.2f Paid:$%.2f",
+                 ctx->txn.transaction_id, ctx->store->name, ctx->total, ctx->payments_total);
+        add_audit_log_entry("Ascend User", "LayawayCreate", details);
+    }
+    show_info_dialog(msg);
+}
+
+static GtkWidget *layaway_new_menu_item(GtkWidget *menu, const char *label, GCallback cb, gpointer data) {
+    GtkWidget *item = gtk_menu_item_new_with_label(label);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    if (cb) g_signal_connect(item, "activate", cb, data);
+    return item;
+}
+
+static void layaway_workbench_dialog(Store *s, int store_idx, int customer_idx) {
+    LayawayWorkbenchContext *ctx = g_malloc0(sizeof(LayawayWorkbenchContext));
+    ctx->store = s;
+    ctx->store_idx = store_idx;
+    ctx->customer_idx = customer_idx;
+
+    Customer *c = &s->customers[customer_idx];
+    char customer_label[NAME_LEN * 2 + 8];
+    snprintf(customer_label, sizeof(customer_label), "%s %s", c->first_name, c->last_name);
+    set_main_window_context_title(s->name, "Layaway", customer_label);
+
+    ctx->dialog = gtk_dialog_new_with_buttons("Layaway Workbench",
+                                               GTK_WINDOW(main_window),
+                                               GTK_DIALOG_MODAL,
+                                               "_Close", GTK_RESPONSE_CLOSE,
+                                               NULL);
+    gtk_window_set_default_size(GTK_WINDOW(ctx->dialog), 1450, 900);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(ctx->dialog));
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(root), 8);
+    gtk_container_add(GTK_CONTAINER(area), root);
+
+    GtkWidget *menubar = gtk_menu_bar_new();
+    gtk_box_pack_start(GTK_BOX(root), menubar, FALSE, FALSE, 0);
+
+    GtkWidget *file_menu = gtk_menu_new();
+    GtkWidget *customer_menu = gtk_menu_new();
+    GtkWidget *products_menu = gtk_menu_new();
+    GtkWidget *payments_menu = gtk_menu_new();
+    GtkWidget *view_menu = gtk_menu_new();
+    GtkWidget *tools_menu = gtk_menu_new();
+    GtkWidget *help_menu = gtk_menu_new();
+
+    GtkWidget *file_item = gtk_menu_item_new_with_label("File");
+    GtkWidget *cust_item = gtk_menu_item_new_with_label("Customer");
+    GtkWidget *prod_item = gtk_menu_item_new_with_label("Products");
+    GtkWidget *pay_item = gtk_menu_item_new_with_label("Payments");
+    GtkWidget *view_item = gtk_menu_item_new_with_label("View");
+    GtkWidget *tools_item = gtk_menu_item_new_with_label("Tools");
+    GtkWidget *help_item = gtk_menu_item_new_with_label("Help");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(file_item), file_menu);
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(cust_item), customer_menu);
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(prod_item), products_menu);
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(pay_item), payments_menu);
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(view_item), view_menu);
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(tools_item), tools_menu);
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(help_item), help_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), file_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), cust_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), prod_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), pay_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), view_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), tools_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), help_item);
+
+    layaway_new_menu_item(file_menu, "New", G_CALLBACK(on_layaway_action_info), NULL);
+    layaway_new_menu_item(file_menu, "Save", G_CALLBACK(on_layaway_save), ctx);
+    layaway_new_menu_item(file_menu, "Print", G_CALLBACK(on_layaway_action_info), NULL);
+    layaway_new_menu_item(file_menu, "Exit", G_CALLBACK(on_layaway_action_info), NULL);
+    layaway_new_menu_item(customer_menu, "Lookup", G_CALLBACK(on_layaway_action_info), NULL);
+    layaway_new_menu_item(customer_menu, "Add New", G_CALLBACK(on_layaway_action_info), NULL);
+    layaway_new_menu_item(products_menu, "Inventory", G_CALLBACK(on_layaway_action_info), NULL);
+    layaway_new_menu_item(payments_menu, "Payment Config", G_CALLBACK(on_layaway_action_info), NULL);
+    layaway_new_menu_item(view_menu, "Reports", G_CALLBACK(on_layaway_action_info), NULL);
+    layaway_new_menu_item(view_menu, "Layouts", G_CALLBACK(on_layaway_action_info), NULL);
+    layaway_new_menu_item(tools_menu, "Admin Tools", G_CALLBACK(on_layaway_action_info), NULL);
+    layaway_new_menu_item(tools_menu, "Imports", G_CALLBACK(on_layaway_action_info), NULL);
+    layaway_new_menu_item(tools_menu, "Layaway Policy Settings", G_CALLBACK(layaway_policy_settings_dialog), ctx);
+    layaway_new_menu_item(help_menu, "Documentation", G_CALLBACK(instructions_reference_dialog), NULL);
+
+    GtkWidget *toolbar_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_pack_start(GTK_BOX(root), toolbar_box, FALSE, FALSE, 0);
+    const char *left_buttons[] = {"Back", "Save", "Remove", "Print", "Copy", "Preview", "Barcode", "Email", "Keep Open"};
+    const char *mid_buttons[] = {"Work Order", "WO Detail", "Reservation", "Discount", "Return", "Quote", "Availability"};
+
+    for (int i = 0; i < 9; i++) {
+        GtkWidget *btn = gtk_button_new_with_label(left_buttons[i]);
+        gtk_box_pack_start(GTK_BOX(toolbar_box), btn, FALSE, FALSE, 0);
+        if (strcmp(left_buttons[i], "Save") == 0) g_signal_connect(btn, "clicked", G_CALLBACK(on_layaway_save), ctx);
+        else if (strcmp(left_buttons[i], "Remove") == 0) g_signal_connect(btn, "clicked", G_CALLBACK(on_layaway_remove_selected), ctx);
+        else if (strcmp(left_buttons[i], "Barcode") == 0) g_signal_connect(btn, "clicked", G_CALLBACK(on_layaway_add_by_barcode), ctx);
+        else g_signal_connect(btn, "clicked", G_CALLBACK(on_layaway_action_info), NULL);
+    }
+
+    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
+    gtk_box_pack_start(GTK_BOX(toolbar_box), sep, FALSE, FALSE, 4);
+    for (int i = 0; i < 7; i++) {
+        GtkWidget *btn = gtk_button_new_with_label(mid_buttons[i]);
+        gtk_box_pack_start(GTK_BOX(toolbar_box), btn, FALSE, FALSE, 0);
+        g_signal_connect(btn, "clicked", G_CALLBACK(on_layaway_action_info), NULL);
+    }
+
+    GtkWidget *spacer = gtk_label_new("");
+    gtk_box_pack_start(GTK_BOX(toolbar_box), spacer, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar_box), gtk_label_new("Sales Person:"), FALSE, FALSE, 0);
+    ctx->salesperson_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->salesperson_combo), "Ascend User");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->salesperson_combo), "Manager");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->salesperson_combo), "Sales Associate");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(ctx->salesperson_combo), 0);
+    gtk_box_pack_start(GTK_BOX(toolbar_box), ctx->salesperson_combo, FALSE, FALSE, 0);
+
+    GtkWidget *header_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(header_grid), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(header_grid), 14);
+    gtk_box_pack_start(GTK_BOX(root), header_grid, FALSE, FALSE, 0);
+
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char created_dt[32];
+    strftime(created_dt, sizeof(created_dt), "%m/%d/%Y", tm_info);
+    char created_line[64];
+    snprintf(created_line, sizeof(created_line), "Created: %s", created_dt);
+    ctx->created_label = gtk_label_new(created_line);
+    ctx->modified_label = gtk_label_new("Last Modified: N/A");
+    ctx->created_by_label = gtk_label_new("Created By: Ascend User");
+    ctx->transaction_id_label = gtk_label_new("Transaction ID: Pending Save");
+    gtk_grid_attach(GTK_GRID(header_grid), ctx->created_label, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(header_grid), ctx->modified_label, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(header_grid), ctx->created_by_label, 2, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(header_grid), ctx->transaction_id_label, 3, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(header_grid), gtk_label_new("Due Date:"), 4, 0, 1, 1);
+    ctx->due_date_entry = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(ctx->due_date_entry), "2026-12-31");
+    gtk_grid_attach(GTK_GRID(header_grid), ctx->due_date_entry, 5, 0, 1, 1);
+
+    GtkWidget *title_context = gtk_label_new(NULL);
+    char context_markup[320];
+    snprintf(context_markup, sizeof(context_markup),
+             "<b>Ascend Retail Management Software - %s - [Layaway for %s %s]</b>",
+             s->name, c->first_name, c->last_name);
+    gtk_label_set_markup(GTK_LABEL(title_context), context_markup);
+    gtk_box_pack_start(GTK_BOX(root), title_context, FALSE, FALSE, 0);
+
+    GtkWidget *hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(root), hpaned, TRUE, TRUE, 0);
+
+    GtkWidget *left_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *right_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_paned_pack1(GTK_PANED(hpaned), left_box, TRUE, FALSE);
+    gtk_paned_pack2(GTK_PANED(hpaned), right_box, FALSE, FALSE);
+
+    GtkWidget *barcode_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(left_box), barcode_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(barcode_row), gtk_label_new("Barcode:"), FALSE, FALSE, 0);
+    ctx->barcode_entry = gtk_entry_new();
+    gtk_box_pack_start(GTK_BOX(barcode_row), ctx->barcode_entry, FALSE, FALSE, 0);
+    GtkWidget *barcode_btn = gtk_button_new_with_label("Add by Barcode");
+    gtk_box_pack_start(GTK_BOX(barcode_row), barcode_btn, FALSE, FALSE, 0);
+    g_signal_connect(barcode_btn, "clicked", G_CALLBACK(on_layaway_add_by_barcode), ctx);
+
+    GtkWidget *item_toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(left_box), item_toolbar, FALSE, FALSE, 0);
+    GtkWidget *add_row_btn = gtk_button_new_with_label("Add");
+    GtkWidget *edit_row_btn = gtk_button_new_with_label("Edit");
+    GtkWidget *rem_row_btn = gtk_button_new_with_label("Remove");
+    gtk_box_pack_start(GTK_BOX(item_toolbar), add_row_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(item_toolbar), edit_row_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(item_toolbar), rem_row_btn, FALSE, FALSE, 0);
+    g_signal_connect(add_row_btn, "clicked", G_CALLBACK(on_layaway_add_row), ctx);
+    g_signal_connect(edit_row_btn, "clicked", G_CALLBACK(on_layaway_action_info), NULL);
+    g_signal_connect(rem_row_btn, "clicked", G_CALLBACK(on_layaway_remove_selected), ctx);
+
+    GtkWidget *item_sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_size_request(item_sw, 920, 350);
+    gtk_box_pack_start(GTK_BOX(left_box), item_sw, TRUE, TRUE, 0);
+
+    ctx->items_store = gtk_list_store_new(LAY_COL_COUNT,
+                                          G_TYPE_STRING,
+                                          G_TYPE_STRING,
+                                          G_TYPE_DOUBLE,
+                                          G_TYPE_INT,
+                                          G_TYPE_STRING,
+                                          G_TYPE_DOUBLE,
+                                          G_TYPE_DOUBLE,
+                                          G_TYPE_STRING,
+                                          G_TYPE_STRING);
+    GtkWidget *items_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(ctx->items_store));
+    g_object_set_data(G_OBJECT(ctx->dialog), "layaway_items_tree", items_tree);
+    gtk_tree_selection_set_mode(gtk_tree_view_get_selection(GTK_TREE_VIEW(items_tree)), GTK_SELECTION_MULTIPLE);
+
+    const char *cols[] = {"SKU", "Description", "Price", "Quantity", "Serial No", "MSRP", "Total", "Comments", "Warranty"};
+    for (int i = 0; i < LAY_COL_COUNT; i++) {
+        GtkCellRenderer *rend = gtk_cell_renderer_text_new();
+        if (i != LAY_COL_LINE_TOTAL) {
+            g_object_set(rend, "editable", TRUE, NULL);
+            g_object_set_data(G_OBJECT(rend), "lay-col", GINT_TO_POINTER(i));
+            g_signal_connect(rend, "edited", G_CALLBACK(on_layaway_cell_edited), ctx);
+        }
+        gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(items_tree), -1, cols[i], rend, "text", i, NULL);
+    }
+    gtk_container_add(GTK_CONTAINER(item_sw), items_tree);
+
+    GtkWidget *reg_frame = gtk_frame_new("Bike Registration");
+    gtk_box_pack_start(GTK_BOX(right_box), reg_frame, FALSE, FALSE, 0);
+    GtkWidget *reg_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_set_border_width(GTK_CONTAINER(reg_box), 6);
+    gtk_container_add(GTK_CONTAINER(reg_frame), reg_box);
+    gtk_box_pack_start(GTK_BOX(reg_box), gtk_label_new("Register?"), FALSE, FALSE, 0);
+    ctx->register_status_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->register_status_combo), "Not Registered");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->register_status_combo), "Deferred");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->register_status_combo), "Completed");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(ctx->register_status_combo), 1);
+    gtk_box_pack_start(GTK_BOX(reg_box), ctx->register_status_combo, FALSE, FALSE, 0);
+    ctx->register_date_entry = create_labeled_entry("Register Date:", reg_box);
+    gtk_entry_set_text(GTK_ENTRY(ctx->register_date_entry), "2026-10-31");
+    gtk_box_pack_start(GTK_BOX(reg_box), gtk_label_new("Reminder and API registration hooks ready for expansion."), FALSE, FALSE, 0);
+
+    GtkWidget *cust_frame = gtk_frame_new("Customer Profile");
+    gtk_box_pack_start(GTK_BOX(right_box), cust_frame, FALSE, FALSE, 0);
+    GtkWidget *cust_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(cust_grid), 2);
+    gtk_grid_set_column_spacing(GTK_GRID(cust_grid), 8);
+    gtk_container_set_border_width(GTK_CONTAINER(cust_grid), 6);
+    gtk_container_add(GTK_CONTAINER(cust_frame), cust_grid);
+    char line[160];
+    snprintf(line, sizeof(line), "Name: %s %s", c->first_name, c->last_name);
+    gtk_grid_attach(GTK_GRID(cust_grid), gtk_label_new(line), 0, 0, 2, 1);
+    snprintf(line, sizeof(line), "Email: %s", c->email);
+    gtk_grid_attach(GTK_GRID(cust_grid), gtk_label_new(line), 0, 1, 2, 1);
+    snprintf(line, sizeof(line), "Mobile: %s", c->phone1);
+    gtk_grid_attach(GTK_GRID(cust_grid), gtk_label_new(line), 0, 2, 1, 1);
+    snprintf(line, sizeof(line), "Home: %s", c->phone2);
+    gtk_grid_attach(GTK_GRID(cust_grid), gtk_label_new(line), 1, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(cust_grid), gtk_label_new("Language: English"), 0, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(cust_grid), gtk_label_new("Gender: Unspecified"), 1, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(cust_grid), gtk_label_new("Birthdate: Unspecified"), 0, 4, 2, 1);
+    gtk_grid_attach(GTK_GRID(cust_grid), gtk_label_new("Tags: VIP, Frequent Buyer"), 0, 5, 2, 1);
+    gtk_grid_attach(GTK_GRID(cust_grid), gtk_label_new("Multiple Contacts: supported"), 0, 6, 2, 1);
+
+    GtkWidget *tabs = gtk_notebook_new();
+    gtk_box_pack_start(GTK_BOX(right_box), tabs, TRUE, TRUE, 0);
+    const char *tab_names[] = {"Sales", "History", "Serial Numbers", "Notes", "Groups", "Email"};
+    for (int i = 0; i < 6; i++) {
+        GtkWidget *tab_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+        if (i == 3) {
+            GtkWidget *note_btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+            GtkWidget *add_note_btn = gtk_button_new_with_label("Add");
+            GtkWidget *edit_note_btn = gtk_button_new_with_label("Edit");
+            GtkWidget *remove_note_btn = gtk_button_new_with_label("Remove");
+            gtk_box_pack_start(GTK_BOX(note_btns), add_note_btn, FALSE, FALSE, 0);
+            gtk_box_pack_start(GTK_BOX(note_btns), edit_note_btn, FALSE, FALSE, 0);
+            gtk_box_pack_start(GTK_BOX(note_btns), remove_note_btn, FALSE, FALSE, 0);
+            gtk_box_pack_start(GTK_BOX(tab_box), note_btns, FALSE, FALSE, 0);
+            ctx->notes_store = gtk_list_store_new(3, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_INT);
+            ctx->notes_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(ctx->notes_store));
+            GtkCellRenderer *rend = gtk_cell_renderer_text_new();
+            gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(ctx->notes_tree), -1, "Date", rend, "text", 0, NULL);
+            gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(ctx->notes_tree), -1, "Note", rend, "text", 1, NULL);
+            GtkWidget *notes_sw = gtk_scrolled_window_new(NULL, NULL);
+            gtk_widget_set_size_request(notes_sw, 360, 130);
+            gtk_container_add(GTK_CONTAINER(notes_sw), ctx->notes_tree);
+            gtk_box_pack_start(GTK_BOX(tab_box), notes_sw, TRUE, TRUE, 0);
+            g_signal_connect(add_note_btn, "clicked", G_CALLBACK(on_layaway_note_add), ctx);
+            g_signal_connect(edit_note_btn, "clicked", G_CALLBACK(on_layaway_note_edit), ctx);
+            g_signal_connect(remove_note_btn, "clicked", G_CALLBACK(on_layaway_note_remove), ctx);
+            refresh_customer_notes_store(ctx);
+        } else {
+            gtk_box_pack_start(GTK_BOX(tab_box), gtk_label_new("Data panel ready for this tab."), FALSE, FALSE, 0);
+        }
+        gtk_notebook_append_page(GTK_NOTEBOOK(tabs), tab_box, gtk_label_new(tab_names[i]));
+    }
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(tabs), 3);
+
+    GtkWidget *payments_frame = gtk_frame_new("Payments");
+    gtk_box_pack_start(GTK_BOX(left_box), payments_frame, FALSE, FALSE, 0);
+    GtkWidget *payments_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(payments_vbox), 6);
+    gtk_container_add(GTK_CONTAINER(payments_frame), payments_vbox);
+
+    GtkWidget *pay_btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_box_pack_start(GTK_BOX(payments_vbox), pay_btn_row, FALSE, FALSE, 0);
+    const char *pay_buttons[] = {"Cash", "Check", "Credit", "Debit", "Gift Card", "Financing", "In-Store", "Coupon", "Trade-In", "Account"};
+    for (int i = 0; i < 10; i++) {
+        GtkWidget *pbtn = gtk_button_new_with_label(pay_buttons[i]);
+        g_object_set_data(G_OBJECT(pbtn), "pay-type", (gpointer)pay_buttons[i]);
+        g_signal_connect(pbtn, "clicked", G_CALLBACK(on_layaway_add_payment), ctx);
+        gtk_box_pack_start(GTK_BOX(pay_btn_row), pbtn, FALSE, FALSE, 0);
+    }
+
+    ctx->payments_store = gtk_list_store_new(4, G_TYPE_STRING, G_TYPE_DOUBLE, G_TYPE_STRING, G_TYPE_STRING);
+    GtkWidget *pay_tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(ctx->payments_store));
+    GtkCellRenderer *pay_r = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(pay_tree), -1, "Date", pay_r, "text", 0, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(pay_tree), -1, "Amount", pay_r, "text", 1, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(pay_tree), -1, "Payment Type", pay_r, "text", 2, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(pay_tree), -1, "User Added", pay_r, "text", 3, NULL);
+    GtkWidget *pay_sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_size_request(pay_sw, 900, 120);
+    gtk_container_add(GTK_CONTAINER(pay_sw), pay_tree);
+    gtk_box_pack_start(GTK_BOX(payments_vbox), pay_sw, TRUE, TRUE, 0);
+
+    GtkWidget *comments_frame = gtk_frame_new("Comments");
+    gtk_box_pack_start(GTK_BOX(left_box), comments_frame, FALSE, FALSE, 0);
+    GtkWidget *comments_text = gtk_text_view_new();
+    gtk_widget_set_size_request(comments_text, 900, 90);
+    gtk_container_add(GTK_CONTAINER(comments_frame), comments_text);
+
+    GtkWidget *totals_frame = gtk_frame_new("Totals");
+    gtk_box_pack_start(GTK_BOX(right_box), totals_frame, FALSE, FALSE, 0);
+    GtkWidget *totals_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(totals_box), 6);
+    gtk_container_add(GTK_CONTAINER(totals_frame), totals_box);
+    ctx->subtotal_label = gtk_label_new("Subtotal: $0.00");
+    ctx->tax_label = gtk_label_new("Tax: $0.00");
+    ctx->total_label = gtk_label_new("Total: $0.00");
+    ctx->payments_label = gtk_label_new("Payments: $0.00");
+    ctx->balance_label = gtk_label_new("Balance: $0.00");
+    gtk_box_pack_start(GTK_BOX(totals_box), ctx->subtotal_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(totals_box), ctx->tax_label, FALSE, FALSE, 0);
+    ctx->tax_rate_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->tax_rate_combo), "Tax 0% (Exempt)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->tax_rate_combo), "Tax 4%");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->tax_rate_combo), "Tax 7%");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctx->tax_rate_combo), "Tax 8.25%");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(ctx->tax_rate_combo), 3);
+    gtk_box_pack_start(GTK_BOX(totals_box), ctx->tax_rate_combo, FALSE, FALSE, 0);
+    ctx->shipping_entry = create_labeled_entry("Shipping:", totals_box);
+    gtk_entry_set_text(GTK_ENTRY(ctx->shipping_entry), "0.00");
+    ctx->discount_entry = create_labeled_entry("Discount:", totals_box);
+    gtk_entry_set_text(GTK_ENTRY(ctx->discount_entry), "0.00");
+    gtk_box_pack_start(GTK_BOX(totals_box), ctx->total_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(totals_box), ctx->payments_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(totals_box), ctx->balance_label, FALSE, FALSE, 0);
+
+    GtkWidget *serial_btn = gtk_button_new_with_label("Serial Lookup / History");
+    gtk_box_pack_start(GTK_BOX(totals_box), serial_btn, FALSE, FALSE, 0);
+    g_signal_connect(serial_btn, "clicked", G_CALLBACK(on_layaway_serial_lookup), ctx);
+
+    GtkWidget *status_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_box_pack_start(GTK_BOX(root), status_row, FALSE, FALSE, 0);
+    GtkWidget *status_left = gtk_label_new("Connection: Online | Sync: Active");
+    ctx->status_right_label = gtk_label_new(NULL);
+    char status_right[256];
+    snprintf(status_right, sizeof(status_right), "Version 1.0 | DB 1.0 | Store %s | Workstation WS-01 | User Ascend User", s->name);
+    gtk_label_set_text(GTK_LABEL(ctx->status_right_label), status_right);
+    gtk_box_pack_start(GTK_BOX(status_row), status_left, FALSE, FALSE, 0);
+    GtkWidget *status_spacer = gtk_label_new("");
+    gtk_box_pack_start(GTK_BOX(status_row), status_spacer, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(status_row), ctx->status_right_label, FALSE, FALSE, 0);
+
+    g_signal_connect(ctx->shipping_entry, "changed", G_CALLBACK(on_layaway_shipping_changed), ctx);
+    g_signal_connect(ctx->discount_entry, "changed", G_CALLBACK(on_layaway_discount_changed), ctx);
+    g_signal_connect(ctx->tax_rate_combo, "changed", G_CALLBACK(on_layaway_tax_changed), ctx);
+
+    layaway_recalc_totals(ctx);
+    gtk_widget_show_all(ctx->dialog);
+    gtk_dialog_run(GTK_DIALOG(ctx->dialog));
+    gtk_widget_destroy(ctx->dialog);
+    reset_main_window_title();
+    g_free(ctx);
+}
+
 static void create_layaway_dialog(void) {
     int si = choose_store_index();
     if (si < 0) return;
@@ -3487,22 +5176,6 @@ static void create_layaway_dialog(void) {
         return;
     }
 
-    if (s->sales_count >= MAX_TRANSACTIONS) {
-        show_error_dialog("Maximum transactions reached for this store.");
-        return;
-    }
-
-    // Initialize new layaway transaction
-    Transaction txn;
-    memset(&txn, 0, sizeof(Transaction));
-    txn.item_count = 0;
-    txn.total = 0;
-    txn.amount_paid = 0;
-    txn.status = 0; // open layaway (automatically set)
-    txn.customer_idx = -1; // none selected yet
-    sprintf(txn.transaction_id, "LAY-%d-%ld", si, (long)time(NULL) % 10000);
-
-    // Select Customer
     GtkWidget *cust_dialog = gtk_dialog_new_with_buttons("Select Customer for Layaway",
                                                          GTK_WINDOW(main_window),
                                                          GTK_DIALOG_MODAL,
@@ -3512,312 +5185,24 @@ static void create_layaway_dialog(void) {
     GtkWidget *cust_area = gtk_dialog_get_content_area(GTK_DIALOG(cust_dialog));
     GtkWidget *cust_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     gtk_container_add(GTK_CONTAINER(cust_area), cust_box);
-
-    GtkWidget *search_entry = create_labeled_entry("Search (name/company):", cust_box);
     GtkWidget *cust_combo = gtk_combo_box_text_new();
-
-    // Populate customer list
     for (int i = 0; i < s->customer_count; i++) {
         if (s->customers[i].hidden) continue;
-        Customer *c = &s->customers[i];
         char entry[NAME_LEN * 2];
-        sprintf(entry, "%s %s (%s)", c->first_name, c->last_name, c->company);
+        snprintf(entry, sizeof(entry), "%s %s (%s)", s->customers[i].first_name, s->customers[i].last_name, s->customers[i].company);
         gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(cust_combo), entry);
     }
-
     gtk_box_pack_start(GTK_BOX(cust_box), gtk_label_new("Select Customer:"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(cust_box), cust_combo, FALSE, FALSE, 0);
     gtk_widget_show_all(cust_dialog);
 
-    if (gtk_dialog_run(GTK_DIALOG(cust_dialog)) != GTK_RESPONSE_OK) {
-        gtk_widget_destroy(cust_dialog);
-        return;
-    }
-
-    int cust_idx = gtk_combo_box_get_active(GTK_COMBO_BOX(cust_combo));
-    if (cust_idx >= 0 && cust_idx < s->customer_count) {
-        txn.customer_idx = cust_idx;
+    if (gtk_dialog_run(GTK_DIALOG(cust_dialog)) == GTK_RESPONSE_OK) {
+        int ci = gtk_combo_box_get_active(GTK_COMBO_BOX(cust_combo));
+        if (ci >= 0 && ci < s->customer_count) {
+            layaway_workbench_dialog(s, si, ci);
+        }
     }
     gtk_widget_destroy(cust_dialog);
-
-    // Main layaway transaction dialog
-    GtkWidget *txn_dialog = gtk_dialog_new_with_buttons("Layaway Transaction Editor",
-                                                        GTK_WINDOW(main_window),
-                                                        GTK_DIALOG_MODAL,
-                                                        "_Add Item", 1,
-                                                        "_Take Payment", 2,
-                                                        "_Save Layaway", 3,
-                                                        "_Cancel", GTK_RESPONSE_CANCEL,
-                                                        NULL);
-    GtkWidget *txn_area = gtk_dialog_get_content_area(GTK_DIALOG(txn_dialog));
-    GtkWidget *txn_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    gtk_container_add(GTK_CONTAINER(txn_area), txn_box);
-
-    // Customer info header
-    char cust_info[NAME_LEN * 3];
-    if (txn.customer_idx >= 0) {
-        Customer *c = &s->customers[txn.customer_idx];
-        sprintf(cust_info, "Customer: %s %s (%s)", c->first_name, c->last_name, c->company);
-    } else {
-        sprintf(cust_info, "Customer: Not selected");
-    }
-    gtk_box_pack_start(GTK_BOX(txn_box), gtk_label_new(cust_info), FALSE, FALSE, 0);
-
-    // Keep open indicator (always on for layaways)
-    GtkWidget *keep_open_label = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(keep_open_label), "<b>Layaway - Transaction will remain open</b>");
-    gtk_box_pack_start(GTK_BOX(txn_box), keep_open_label, FALSE, FALSE, 0);
-
-    // Item list display
-    GtkWidget *item_sw = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(item_sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    GtkWidget *item_view = gtk_text_view_new();
-    gtk_text_view_set_editable(GTK_TEXT_VIEW(item_view), FALSE);
-    gtk_container_add(GTK_CONTAINER(item_sw), item_view);
-    gtk_box_pack_start(GTK_BOX(txn_box), item_sw, TRUE, TRUE, 0);
-
-    GtkWidget *total_label = gtk_label_new("Total: $0.00");
-    gtk_box_pack_start(GTK_BOX(txn_box), total_label, FALSE, FALSE, 0);
-
-    gtk_widget_set_size_request(txn_dialog, 500, 400);
-    gtk_widget_show_all(txn_dialog);
-
-    // Transaction editing loop
-    int done = 0;
-    while (!done) {
-        // Update item list display
-        GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(item_view));
-        char item_text[2000] = "LAYAWAY ITEMS:\n\n";
-        for (int i = 0; i < txn.item_count; i++) {
-            Product *p = NULL;
-            for (int j = 0; j < s->product_count; j++) {
-                if (strcmp(s->products[j].sku, txn.item_sku[i]) == 0) {
-                    p = &s->products[j];
-                    break;
-                }
-            }
-            if (p) {
-                char line[200];
-                sprintf(line, "%d. %s (SKU: %s) Qty: %d @ $%.2f = $%.2f\n",
-                        i + 1, p->name, p->sku, txn.qty[i], txn.item_price[i],
-                        txn.item_price[i] * txn.qty[i]);
-                strcat(item_text, line);
-            }
-        }
-        gtk_text_buffer_set_text(buf, item_text, -1);
-
-        char total_str[100];
-        sprintf(total_str, "Total: $%.2f", txn.total);
-        gtk_label_set_text(GTK_LABEL(total_label), total_str);
-
-        int response = gtk_dialog_run(GTK_DIALOG(txn_dialog));
-
-        if (response == 1) { // Add Item
-            // Product search dialog
-            GtkWidget *prod_dialog = gtk_dialog_new_with_buttons("Add Product to Layaway",
-                                                                 GTK_WINDOW(main_window),
-                                                                 GTK_DIALOG_MODAL,
-                                                                 "_Add", GTK_RESPONSE_OK,
-                                                                 "_Cancel", GTK_RESPONSE_CANCEL,
-                                                                 NULL);
-            GtkWidget *prod_area = gtk_dialog_get_content_area(GTK_DIALOG(prod_dialog));
-            GtkWidget *prod_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-            gtk_container_add(GTK_CONTAINER(prod_area), prod_box);
-
-            GtkWidget *sku_entry = create_labeled_entry("SKU/UPC:", prod_box);
-            GtkWidget *qty_entry = create_labeled_entry("Quantity:", prod_box);
-            gtk_entry_set_text(GTK_ENTRY(qty_entry), "1");
-
-            gtk_widget_show_all(prod_dialog);
-
-            if (gtk_dialog_run(GTK_DIALOG(prod_dialog)) == GTK_RESPONSE_OK) {
-                const char *sku = gtk_entry_get_text(GTK_ENTRY(sku_entry));
-                const char *qty_str = gtk_entry_get_text(GTK_ENTRY(qty_entry));
-
-                Product *p = NULL;
-                for (int j = 0; j < s->product_count; j++) {
-                    if (strcmp(s->products[j].sku, sku) == 0) {
-                        p = &s->products[j];
-                        break;
-                    }
-                }
-
-                if (p && txn.item_count < MAX_PRODUCTS) {
-                    int qty = atoi(qty_str);
-                    int is_special_order = 0;
-                    char so_comments[NAME_LEN] = "";
-                    char sale_serial[NAME_LEN] = "";
-
-                    if (p->serialized) {
-                        char serial_ctx[200];
-                        sprintf(serial_ctx, "Product: %s\nSKU: %s\n\nSerial number capture at time of sale is required.", p->name, p->sku);
-                        if (!prompt_for_serial_number_dialog("Enter Serial Number", serial_ctx, sale_serial, sizeof(sale_serial))) {
-                            gtk_widget_destroy(prod_dialog);
-                            continue;
-                        }
-                    }
-
-                    // Check if out of stock
-                    if (p->stock < qty) {
-                        special_order_prompt_dialog(s, sku, qty, &is_special_order, so_comments);
-                    }
-
-                    strncpy(txn.item_sku[txn.item_count], sku, NAME_LEN - 1);
-                    txn.item_price[txn.item_count] = p->price;
-                    txn.qty[txn.item_count] = qty;
-                    txn.is_special_order[txn.item_count] = is_special_order;
-                    if (is_special_order) {
-                        strncpy(txn.so_comments[txn.item_count], so_comments, NAME_LEN - 1);
-                    } else if (p->serialized) {
-                        strncpy(txn.so_comments[txn.item_count], sale_serial, NAME_LEN - 1);
-                    }
-                    txn.total += p->price * qty;
-                    txn.item_count++;
-
-                    // Create special order record if needed
-                    if (is_special_order) {
-                        SpecialOrder so;
-                        memset(&so, 0, sizeof(SpecialOrder));
-                        so.special_order_id = s->special_order_count;
-                        strncpy(so.product_sku, sku, NAME_LEN-1);
-                        so.product_sku[NAME_LEN-1] = '\0';
-                        so.store_idx = si;
-                        so.customer_idx = txn.customer_idx;
-                        so.qty_ordered = qty;
-                        so.status = SO_STATUS_NOT_ORDERED;
-                        so.type = (strcmp(so_comments, "Transfer requested from another store") == 0) ? SO_TYPE_REQUEST_TRANSFER : SO_TYPE_MARK_FOR_SO;
-                        strncpy(so.comments, so_comments, sizeof(so.comments)-1);
-                        so.comments[sizeof(so.comments)-1] = '\0';
-                        time_t now = time(NULL);
-                        struct tm *tm_info = localtime(&now);
-                        strftime(so.order_date, NAME_LEN, "%Y-%m-%d", tm_info);
-                        strcpy(so.expected_date, "");
-                        strcpy(so.received_date, "");
-                        strcpy(so.po_number, "");
-                        so.transfer_store_idx = -1;
-                        strcpy(so.serial_number, "");
-                        so.notified = 0;
-                        strcpy(so.notification_method, "");
-
-                        s->special_orders[s->special_order_count++] = so;
-                    }
-                } else if (!p) {
-                    show_error_dialog("Product not found!");
-                } else {
-                    show_error_dialog("Maximum items reached for this transaction.");
-                }
-            }
-
-            gtk_widget_destroy(prod_dialog);
-
-        } else if (response == 2) { // Take Payment
-            // Payment dialog
-            GtkWidget *pay_dialog = gtk_dialog_new_with_buttons("Take Payment for Layaway",
-                                                                GTK_WINDOW(main_window),
-                                                                GTK_DIALOG_MODAL,
-                                                                "_Apply Payment", 1,
-                                                                "_Cancel", GTK_RESPONSE_CANCEL,
-                                                                NULL);
-            GtkWidget *pay_area = gtk_dialog_get_content_area(GTK_DIALOG(pay_dialog));
-            GtkWidget *pay_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-            gtk_container_add(GTK_CONTAINER(pay_area), pay_box);
-
-            char pay_info[200];
-            sprintf(pay_info, "Total: $%.2f\nPaid: $%.2f\nRemaining: $%.2f",
-                    txn.total, txn.amount_paid, txn.total - txn.amount_paid);
-            gtk_box_pack_start(GTK_BOX(pay_box), gtk_label_new(pay_info), FALSE, FALSE, 0);
-
-            GtkWidget *amount_entry = create_labeled_entry("Payment Amount:", pay_box);
-            char default_amount[20];
-            sprintf(default_amount, "%.2f", txn.total - txn.amount_paid);
-            gtk_entry_set_text(GTK_ENTRY(amount_entry), default_amount);
-
-            GtkWidget *payment_combo = gtk_combo_box_text_new();
-            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(payment_combo), "Cash");
-            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(payment_combo), "Credit");
-            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(payment_combo), "Debit");
-            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(payment_combo), "Gift Card");
-            gtk_combo_box_set_active(GTK_COMBO_BOX(payment_combo), 0);
-            gtk_box_pack_start(GTK_BOX(pay_box), gtk_label_new("Payment Type:"), FALSE, FALSE, 0);
-            gtk_box_pack_start(GTK_BOX(pay_box), payment_combo, FALSE, FALSE, 0);
-
-            gtk_widget_show_all(pay_dialog);
-
-            if (gtk_dialog_run(GTK_DIALOG(pay_dialog)) == 1) {
-                const char *amount_str = gtk_entry_get_text(GTK_ENTRY(amount_entry));
-                double payment = atof(amount_str);
-                int payment_type = gtk_combo_box_get_active(GTK_COMBO_BOX(payment_combo));
-
-                if (payment > 0) {
-                    txn.amount_paid += payment;
-                    txn.payment_type = payment_type;
-
-                    // Update product stock
-                    for (int i = 0; i < txn.item_count; i++) {
-                        Product *p = NULL;
-                        for (int j = 0; j < s->product_count; j++) {
-                            if (strcmp(s->products[j].sku, txn.item_sku[i]) == 0) {
-                                p = &s->products[j];
-                                break;
-                            }
-                        }
-                        if (p) {
-                            p->sold += txn.qty[i];
-                            // Don't reduce stock for layaways - items stay in inventory
-                        }
-                    }
-
-                    // Set transaction date
-                    time_t now = time(NULL);
-                    struct tm *tm_info = localtime(&now);
-                    strftime(txn.date, NAME_LEN, "%Y-%m-%d %H:%M", tm_info);
-
-                    // Save transaction
-                    s->sales[s->sales_count] = txn;
-                    s->sales_count++;
-                    s->transactions++;
-
-                    char msg[150];
-                    double remaining = txn.total - txn.amount_paid;
-                    sprintf(msg, "Layaway Payment Applied\n\nTotal: $%.2f\nPaid: $%.2f\nRemaining: $%.2f\n\nTransaction will remain open.",
-                            txn.total, txn.amount_paid, remaining);
-                    show_info_dialog(msg);
-
-                    done = 1;
-                }
-            }
-
-            gtk_widget_destroy(pay_dialog);
-
-        } else if (response == 3) { // Save Layaway
-            if (txn.item_count == 0) {
-                show_error_dialog("Cannot save layaway with no items!");
-                continue;
-            }
-
-            // Set transaction date
-            time_t now = time(NULL);
-            struct tm *tm_info = localtime(&now);
-            strftime(txn.date, NAME_LEN, "%Y-%m-%d %H:%M", tm_info);
-
-            // Save transaction
-            s->sales[s->sales_count] = txn;
-            s->sales_count++;
-            s->transactions++;
-
-            char msg[150];
-            sprintf(msg, "Layaway Created\n\nTotal: $%.2f\nPaid: $%.2f\nRemaining: $%.2f\n\nTransaction saved as open layaway.",
-                    txn.total, txn.amount_paid, txn.total - txn.amount_paid);
-            show_info_dialog(msg);
-
-            done = 1;
-
-        } else { // Cancel
-            done = 1;
-        }
-    }
-
-    gtk_widget_destroy(txn_dialog);
 }
 
 static void on_return_item_toggle(GtkCellRendererToggle *renderer, gchar *path_str, gpointer data) {
@@ -4287,6 +5672,12 @@ static void create_return_dialog(void) {
             sprintf(done_msg, "Return Completed!\n\nTransaction ID: %s\nRefund: ($%.2f)\n\nItems have been re-added to inventory.",
                     ret_txn.transaction_id, -ret_txn.total);
             show_info_dialog(done_msg);
+            {
+                char details[220];
+                snprintf(details, sizeof(details), "Txn:%s Original:%s Refund:$%.2f",
+                         ret_txn.transaction_id, ret_txn.original_transaction_id, -ret_txn.total);
+                add_audit_log_entry("Ascend User", "ReturnComplete", details);
+            }
             save_data();
         }
 
@@ -4423,6 +5814,11 @@ static void complete_sale_dialog(void) {
                     }
 
                     show_info_dialog("Transaction completed successfully!");
+                    {
+                        char details[180];
+                        snprintf(details, sizeof(details), "Txn:%s Total:$%.2f", found_txn->transaction_id, found_txn->total);
+                        add_audit_log_entry("Ascend User", "CompleteSale", details);
+                    }
                     save_data();
                     done = 1;
                 }
@@ -4970,12 +6366,14 @@ static void view_layaways_dialog(void) {
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
 
-    GtkListStore *store_list = gtk_list_store_new(6,
+    GtkListStore *store_list = gtk_list_store_new(8,
                                                    G_TYPE_STRING,  // Transaction ID
                                                    G_TYPE_STRING,  // Customer
                                                    G_TYPE_DOUBLE,  // Total
                                                    G_TYPE_DOUBLE,  // Paid
                                                    G_TYPE_DOUBLE,  // Remaining
+                                                   G_TYPE_STRING,  // Due Date
+                                                   G_TYPE_STRING,  // Policy Status
                                                    G_TYPE_INT);    // Transaction Index
 
     GtkTreeView *tree = GTK_TREE_VIEW(gtk_tree_view_new_with_model(GTK_TREE_MODEL(store_list)));
@@ -4986,6 +6384,8 @@ static void view_layaways_dialog(void) {
     gtk_tree_view_insert_column_with_attributes(tree, -1, "Total", renderer, "text", 2, NULL);
     gtk_tree_view_insert_column_with_attributes(tree, -1, "Paid", renderer, "text", 3, NULL);
     gtk_tree_view_insert_column_with_attributes(tree, -1, "Remaining", renderer, "text", 4, NULL);
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "Due Date", renderer, "text", 5, NULL);
+    gtk_tree_view_insert_column_with_attributes(tree, -1, "Policy", renderer, "text", 6, NULL);
 
     // Populate list with layaway transactions
     for (int i = 0; i < s->sales_count; i++) {
@@ -4998,6 +6398,18 @@ static void view_layaways_dialog(void) {
             }
 
             double remaining = txn->total - txn->amount_paid;
+            char due[16] = "(none)";
+            char policy[96] = "On Track";
+            if (get_txn_due_date(txn, due, sizeof(due))) {
+                int days = days_until_date(due);
+                if (days < -app_settings.layaway_grace_days) {
+                    snprintf(policy, sizeof(policy), "Overdue - Cancel Eligible");
+                } else if (days < 0) {
+                    snprintf(policy, sizeof(policy), "Overdue (Grace)");
+                } else if (days <= app_settings.layaway_reminder_days) {
+                    snprintf(policy, sizeof(policy), "Reminder Window");
+                }
+            }
 
             GtkTreeIter iter;
             gtk_list_store_append(store_list, &iter);
@@ -5007,12 +6419,20 @@ static void view_layaways_dialog(void) {
                               2, txn->total,
                               3, txn->amount_paid,
                               4, remaining,
-                              5, i,
+                              5, due,
+                              6, policy,
+                              7, i,
                               -1);
         }
     }
 
     gtk_container_add(GTK_CONTAINER(sw), GTK_WIDGET(tree));
+
+    GtkWidget *btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(vbox), btn_row, FALSE, FALSE, 0);
+    GtkWidget *apply_rules_btn = gtk_button_new_with_label("Apply Cancellation Rules");
+    gtk_box_pack_start(GTK_BOX(btn_row), apply_rules_btn, FALSE, FALSE, 0);
+    g_signal_connect(apply_rules_btn, "clicked", G_CALLBACK(on_apply_layaway_rules_clicked), s);
 
     gtk_widget_set_size_request(dialog, 700, 400);
     gtk_widget_show_all(dialog);
