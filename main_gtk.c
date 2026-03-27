@@ -6,6 +6,23 @@
 #include <sys/stat.h>
 #include <ctype.h>
 
+/*
+ * Ascend Retail Platform (GTK/C)
+ *
+ * High-level architecture:
+ * - In-memory domain model for stores, products, customers, sales, service, and purchasing.
+ * - Dialog-driven desktop workflows (POS, reservations, work orders, reports, admin tools).
+ * - Flat-file persistence using tagged sections in ascend_data.txt for backward-compatible growth.
+ * - Role-based security with manager override support and audit logging for sensitive actions.
+ * - Theme engine with light/dark/smart behavior and mobile-floor display sizing.
+ *
+ * Persistence strategy:
+ * - Base store data is written first, then optional/extended sections are appended.
+ * - Loader uses section markers and defensive parsing so new sections can be introduced safely.
+ * - Unknown or missing sections are tolerated by falling back to defaults.
+ */
+
+/* Capacity limits for in-memory collections. */
 #define MAX_STORES 30
 #define MAX_PRODUCTS 50
 #define MAX_QUOTES 50
@@ -41,35 +58,35 @@ typedef enum { ACCOUNT_INDIVIDUAL, ACCOUNT_COMPANY } AccountType;
 
 /* Customer: a person or company that purchases products and services. */
 typedef struct {
-    char first_name[NAME_LEN];
-    char last_name[NAME_LEN];
-    char company[NAME_LEN];
-    AccountType account_type;
-    char email[NAME_LEN];
-    char phone1[NAME_LEN];
-    char phone2[NAME_LEN];
-    char billing_addr1[NAME_LEN];
-    char billing_addr2[NAME_LEN];
-    char billing_city[NAME_LEN];
-    char billing_state[NAME_LEN];
-    char billing_zip[NAME_LEN];
-    char shipping_addr1[NAME_LEN];
-    char shipping_addr2[NAME_LEN];
-    char shipping_city[NAME_LEN];
-    char shipping_state[NAME_LEN];
-    char shipping_zip[NAME_LEN];
-    int use_billing_for_shipping;
-    char tax_id[NAME_LEN];
+    char first_name[NAME_LEN];          // customer's given name
+    char last_name[NAME_LEN];           // customer's family name
+    char company[NAME_LEN];             // company name for business accounts
+    AccountType account_type;           // individual vs company account classification
+    char email[NAME_LEN];               // primary email contact
+    char phone1[NAME_LEN];              // primary phone number
+    char phone2[NAME_LEN];              // secondary/alternate phone number
+    char billing_addr1[NAME_LEN];       // billing address line 1
+    char billing_addr2[NAME_LEN];       // billing address line 2
+    char billing_city[NAME_LEN];        // billing city
+    char billing_state[NAME_LEN];       // billing state/province
+    char billing_zip[NAME_LEN];         // billing postal/zip code
+    char shipping_addr1[NAME_LEN];      // shipping address line 1
+    char shipping_addr2[NAME_LEN];      // shipping address line 2
+    char shipping_city[NAME_LEN];       // shipping city
+    char shipping_state[NAME_LEN];      // shipping state/province
+    char shipping_zip[NAME_LEN];        // shipping postal/zip code
+    int use_billing_for_shipping;       // 1 when shipping should mirror billing address
+    char tax_id[NAME_LEN];              // tax exemption or resale certificate identifier
     int poa_status; // 0=inactive, 1=active, 2=suspended, 3=closed
-    double credit_limit;
+    double credit_limit;                // customer account credit limit
     int preferred_contact; // 0=email, 1=phone1, 2=phone2
-    int hidden;
-    char notes[NAME_LEN * 2];
-    char gender[NAME_LEN];
-    char birthdate[NAME_LEN];
-    char customer_since[NAME_LEN];
-    char last_visit[NAME_LEN];
-    char customer_group[NAME_LEN];
+    int hidden;                         // soft-delete/archival flag
+    char notes[NAME_LEN * 2];           // general staff notes
+    char gender[NAME_LEN];              // optional demographic field
+    char birthdate[NAME_LEN];           // optional birth date for CRM context
+    char customer_since[NAME_LEN];      // first-known customer date
+    char last_visit[NAME_LEN];          // last sale/service touch date
+    char customer_group[NAME_LEN];      // segmentation tag (VIP, Team, etc.)
 } Customer;
 
 /* Product: an item tracked in inventory with SKU and price stock information. */
@@ -77,28 +94,28 @@ typedef struct {
     char sku[NAME_LEN];      // internal stock keeping unit
     char name[NAME_LEN];     // human-readable product name
     char vendor[NAME_LEN];   // vendor name
-    char brand[NAME_LEN];
-    char upc[NAME_LEN];
-    char manufacturer_part_number[NAME_LEN];
-    char style_name[NAME_LEN];
-    char style_number[NAME_LEN];
-    int model_year;
-    char color[NAME_LEN];
-    char size[NAME_LEN];
+    char brand[NAME_LEN];   // brand name (Trek, Giant, etc.)
+    char upc[NAME_LEN];     // UPC/barcode reference
+    char manufacturer_part_number[NAME_LEN]; // manufacturer catalog part number
+    char style_name[NAME_LEN];   // style/family name for matrix products
+    char style_number[NAME_LEN]; // model/style number token
+    int model_year;          // model year
+    char color[NAME_LEN];    // color variant
+    char size[NAME_LEN];     // size variant
     int serialized;          // 1=yes (serialized/bike), 0=no
-    double msrp;
+    double msrp;             // manufacturer suggested retail price
     double price;            // unit retail price
-    double average_cost;
-    double last_cost;
-    int ecommerce_sync;
+    double average_cost;     // blended average unit cost
+    double last_cost;        // most recent received unit cost
+    int ecommerce_sync;      // 1 when item is flagged for eCommerce sync
     int stock;               // current available on hand in store
-    int on_order_qty;
-    int received_qty;
-    int committed_qty;
-    int min_on_season;
-    int max_on_season;
-    int min_off_season;
-    int max_off_season;
+    int on_order_qty;        // quantity ordered but not yet received
+    int received_qty;        // cumulative quantity received
+    int committed_qty;       // quantity reserved by open layaways/reservations
+    int min_on_season;       // low-stock target for in-season planning
+    int max_on_season;       // upper stock target for in-season planning
+    int min_off_season;      // low-stock target for off-season planning
+    int max_off_season;      // upper stock target for off-season planning
     int sold;                // cumulative sold count (not decremented)
 } Product;
 
@@ -106,26 +123,26 @@ typedef struct {
  * active=1 means open quote, 0 means processed.
  */
 typedef struct {
-    char customer[NAME_LEN];
-    char quote_id[NAME_LEN];
-    int item_count;
-    char item_sku[MAX_PRODUCTS][NAME_LEN];
-    int qty[MAX_PRODUCTS];
-    double total;
+    char customer[NAME_LEN];                 // display customer name for quote
+    char quote_id[NAME_LEN];                 // user-visible quote identifier
+    int item_count;                          // line count in quote
+    char item_sku[MAX_PRODUCTS][NAME_LEN];   // SKU per quote line
+    int qty[MAX_PRODUCTS];                   // quantity per quote line
+    double total;                            // quote grand total
     int active; // 1=open,0=closed
     int register_status[MAX_PRODUCTS]; // 0=none yet,1=registered,2=deferred,3=skipped,4=declined
-    char postpone_date[MAX_PRODUCTS][NAME_LEN];
+    char postpone_date[MAX_PRODUCTS][NAME_LEN]; // deferred registration date per line
 } Quote;
 
 /* SpecialOrder: tracks out-of-stock items ordered for customers */
 typedef struct {
-    int special_order_id;
+    int special_order_id; // unique special-order record ID
     int transaction_idx; // which transaction this relates to
     int store_idx; // which store
     int customer_idx; // which customer
-    char product_sku[NAME_LEN];
-    int qty_ordered;
-    SpecialOrderStatus status;
+    char product_sku[NAME_LEN]; // SKU requested on special order
+    int qty_ordered;            // quantity requested
+    SpecialOrderStatus status;  // current order lifecycle state
     char order_date[NAME_LEN]; // YYYY-MM-DD
     char expected_date[NAME_LEN]; // estimated arrival
     char received_date[NAME_LEN]; // when item arrived
@@ -134,17 +151,17 @@ typedef struct {
     char notification_method[NAME_LEN]; // email, phone, text
     char po_number[NAME_LEN]; // purchase order number if associated
     int transfer_store_idx; // -1 if not a transfer, otherwise store index
-    SpecialOrderType type;
-    char serial_number[NAME_LEN];
+    SpecialOrderType type; // workflow type used to create this special order
+    char serial_number[NAME_LEN]; // serial reference if applicable
 } SpecialOrder;
 
 /* Transaction: a completed or in-progress sale record with payment tracking.
  * status: 0=open layaway, 1=completed, 2=paid in full, 3=canceled layaway
  */
 typedef struct {
-    char transaction_id[NAME_LEN];
+    char transaction_id[NAME_LEN]; // unique sale/layaway transaction identifier
     int customer_idx; // index into store's customers array (-1 if not linked)
-    int item_count;
+    int item_count; // number of line items in transaction
     char item_sku[MAX_PRODUCTS][NAME_LEN];
     double item_price[MAX_PRODUCTS]; // price at time of sale
     int qty[MAX_PRODUCTS];
@@ -152,11 +169,11 @@ typedef struct {
     char so_comments[MAX_PRODUCTS][NAME_LEN]; // special order notes per item
     int special_order_id[MAX_PRODUCTS]; // ID of special order if applicable
     int so_status[MAX_PRODUCTS]; // status of special order
-    double total;
-    double amount_paid;
+    double total;        // transaction total due
+    double amount_paid;  // amount paid to date
     PaymentType payment_type; // 0=cash, 1=credit, 2=debit, 3=gift
     int status; // 0=open/layaway, 1=completed, 2=paid in full
-    char notes[NAME_LEN * 2];
+    char notes[NAME_LEN * 2]; // freeform operational notes and flags
     char date[NAME_LEN]; // YYYY-MM-DD format or empty
     int print_receipt; // 1=yes, 0=no
     int is_return; // 1 if this is a return transaction
@@ -165,171 +182,171 @@ typedef struct {
 
 typedef struct {
     int enable_campaign_emails; // 1=on,0=off
-    char proof_email[NAME_LEN];
-    char facebook_url[NAME_LEN];
-    char twitter_url[NAME_LEN];
-    char survey_url[NAME_LEN];
-    int post_purchase_email_enabled;
-    char post_purchase_message[NAME_LEN * 2];
+    char proof_email[NAME_LEN];              // recipient for proof/test sends
+    char facebook_url[NAME_LEN];             // store Facebook profile URL
+    char twitter_url[NAME_LEN];              // store Twitter/X profile URL
+    char survey_url[NAME_LEN];               // post-purchase survey destination
+    int post_purchase_email_enabled;         // toggle for follow-up email messaging
+    char post_purchase_message[NAME_LEN * 2];// follow-up content template
 } TrekMarketingSettings;
 
 typedef struct {
-    char description[NAME_LEN * 2];
-    int requires_tax_id;
-    int hidden;
+    char description[NAME_LEN * 2]; // tax exception reason text
+    int requires_tax_id;             // 1 when tax ID is mandatory for this reason
+    int hidden;                      // soft-delete/archival flag
 } TaxExceptionReason;
 
 typedef struct {
-    char user_name[NAME_LEN];
+    char user_name[NAME_LEN];         // employee/user for this clock event
     char start_time[NAME_LEN]; // YYYY-MM-DD HH:MM
-    int has_end_time;
+    int has_end_time;                 // 1 when shift has clock-out time
     char end_time[NAME_LEN]; // YYYY-MM-DD HH:MM
-    int hidden;
+    int hidden;                       // soft-delete/archival flag
 } TimeClockEntry;
 
 typedef struct {
-    int prompt_work_order_serial;
-    int prompt_receiving_serial;
-    int layaway_reminder_days;
-    int layaway_grace_days;
-    double layaway_cancel_fee_percent;
-    int layaway_auto_cancel_enabled;
-    double default_tax_rate;
-    double max_discount_percent_sales;
+    int prompt_work_order_serial;     // ask for serial when creating work orders
+    int prompt_receiving_serial;      // ask for serial at receiving
+    int layaway_reminder_days;        // reminder threshold before layaway due date
+    int layaway_grace_days;           // grace period after due date
+    double layaway_cancel_fee_percent;// fee metadata used on auto-cancel
+    int layaway_auto_cancel_enabled;  // enables automatic cancellation enforcement
+    double default_tax_rate;          // default tax rate for tax-aware flows
+    double max_discount_percent_sales;// max sales discount policy threshold
 } AppSettings;
 
 typedef struct {
-    int store_idx;
-    int customer_idx;
-    char date[NAME_LEN];
-    char note[NAME_LEN * 4];
-    int hidden;
+    int store_idx;           // owning store index
+    int customer_idx;        // linked customer index
+    char date[NAME_LEN];     // note date stamp
+    char note[NAME_LEN * 4]; // note body text
+    int hidden;              // soft-delete/archival flag
 } CustomerNote;
 
 typedef enum { WO_OPEN, WO_WAITING_PARTS, WO_IN_PROGRESS, WO_COMPLETED, WO_PICKED_UP } WorkOrderStatus;
 
 typedef struct {
-    int id;
-    int store_idx;
-    int customer_idx;
-    char serial[NAME_LEN];
-    char problem[NAME_LEN * 4];
-    char assigned_mechanic[NAME_LEN];
-    WorkOrderStatus status;
-    double labor_rate;
-    double labor_hours;
-    double parts_total;
-    double labor_total;
-    double total;
-    char created_at[NAME_LEN];
-    char updated_at[NAME_LEN];
-    int hidden;
+    int id;                        // unique work order ID
+    int store_idx;                 // owning store index
+    int customer_idx;              // linked customer index
+    char serial[NAME_LEN];         // bike/frame serial
+    char problem[NAME_LEN * 4];    // customer complaint/service description
+    char assigned_mechanic[NAME_LEN]; // assigned technician name
+    WorkOrderStatus status;        // lifecycle status
+    double labor_rate;             // hourly labor rate
+    double labor_hours;            // estimated/actual labor hours
+    double parts_total;            // parts charge subtotal
+    double labor_total;            // labor_rate * labor_hours
+    double total;                  // labor_total + parts_total
+    char created_at[NAME_LEN];     // creation timestamp
+    char updated_at[NAME_LEN];     // last update timestamp
+    int hidden;                    // soft-delete/archival flag
 } WorkOrder;
 
 typedef struct {
-    char timestamp[NAME_LEN];
-    char user[NAME_LEN];
-    char action[NAME_LEN];
-    char details[NAME_LEN * 4];
-    int hidden;
+    char timestamp[NAME_LEN];      // event time
+    char user[NAME_LEN];           // actor
+    char action[NAME_LEN];         // event verb/category
+    char details[NAME_LEN * 4];    // event payload
+    int hidden;                    // soft-delete/archival flag
 } AuditLog;
 
 typedef struct {
-    int id;
-    int store_idx;
-    int customer_idx;
-    char sku[NAME_LEN];
-    int qty;
-    char expiry_date[NAME_LEN];
+    int id;                    // unique reservation ID
+    int store_idx;             // owning store index
+    int customer_idx;          // linked customer index
+    char sku[NAME_LEN];        // reserved SKU
+    int qty;                   // reserved quantity
+    char expiry_date[NAME_LEN];// reservation expiry date
     int status; // 0=active,1=fulfilled,2=canceled,3=expired
-    char created_at[NAME_LEN];
-    int hidden;
+    char created_at[NAME_LEN]; // reservation creation timestamp
+    int hidden;                // soft-delete/archival flag
 } Reservation;
 
 typedef struct {
-    int store_idx;
-    char transaction_id[NAME_LEN];
-    char payment_method[NAME_LEN];
-    double amount;
-    char date[NAME_LEN];
-    char note[NAME_LEN * 2];
-    int hidden;
+    int store_idx;                  // store that accepted payment
+    char transaction_id[NAME_LEN];  // linked transaction ID
+    char payment_method[NAME_LEN];  // tender type text
+    double amount;                  // tender amount
+    char date[NAME_LEN];            // payment date
+    char note[NAME_LEN * 2];        // context/narrative note
+    int hidden;                     // soft-delete/archival flag
 } PaymentEntry;
 
 typedef struct {
-    int id;
-    int store_idx;
-    char sku[NAME_LEN];
-    char vendor[NAME_LEN];
-    int qty_ordered;
-    int qty_received;
+    int id;                    // purchase order ID
+    int store_idx;             // store placing PO
+    char sku[NAME_LEN];        // ordered SKU
+    char vendor[NAME_LEN];     // source vendor name
+    int qty_ordered;           // total ordered quantity
+    int qty_received;          // cumulative received quantity
     int status; // 0=open, 1=partial, 2=received, 3=canceled
-    char expected_date[NAME_LEN];
-    char received_date[NAME_LEN];
-    char created_at[NAME_LEN];
-    char comments[NAME_LEN * 2];
-    int hidden;
+    char expected_date[NAME_LEN]; // expected arrival date
+    char received_date[NAME_LEN]; // full receipt date
+    char created_at[NAME_LEN];    // creation timestamp
+    char comments[NAME_LEN * 2];  // buyer notes
+    int hidden;                   // soft-delete/archival flag
 } PurchaseOrder;
 
 typedef struct {
-    int store_idx;
-    char in_store_sku[NAME_LEN];
-    char vendor_name[NAME_LEN];
-    char vendor_product_code[NAME_LEN];
-    char vendor_description[NAME_LEN * 2];
-    int hidden;
+    int store_idx;                         // owning store index
+    char in_store_sku[NAME_LEN];           // local SKU
+    char vendor_name[NAME_LEN];            // vendor/distributor
+    char vendor_product_code[NAME_LEN];    // vendor-specific SKU/part code
+    char vendor_description[NAME_LEN * 2]; // vendor-facing description
+    int hidden;                            // soft-delete/archival flag
 } VendorProductLink;
 
 typedef struct {
-    char sku[NAME_LEN];
-    char description[NAME_LEN * 2];
-    double weight_lbs;
-    char image_url[NAME_LEN * 2];
-    int nv_qty;
-    int pa_qty;
-    int wi_qty;
-    int hidden;
+    char sku[NAME_LEN];               // QBP catalog SKU
+    char description[NAME_LEN * 2];   // QBP description
+    double weight_lbs;                // shipping/item weight
+    char image_url[NAME_LEN * 2];     // image URL or local image path
+    int nv_qty;                       // Nevada warehouse quantity
+    int pa_qty;                       // Pennsylvania warehouse quantity
+    int wi_qty;                       // Wisconsin warehouse quantity
+    int hidden;                       // soft-delete/archival flag
 } QbpCatalogItem;
 
 typedef struct {
-    int store_idx;
-    int customer_idx;
-    char manufacturer[NAME_LEN];
-    char manufacturer_order_number[NAME_LEN];
-    char model_name[NAME_LEN];
-    char labor_sku[NAME_LEN];
+    int store_idx;                        // receiving store index
+    int customer_idx;                     // linked customer index (or -1)
+    char manufacturer[NAME_LEN];          // brand source (Trek/Giant/Cannondale)
+    char manufacturer_order_number[NAME_LEN]; // upstream web-order number
+    char model_name[NAME_LEN];            // bike model text
+    char labor_sku[NAME_LEN];             // local labor SKU for assembly
     int status; // 0=pending assembly,1=in stand,2=ready for pickup,3=picked up
-    int hidden;
+    int hidden;                           // soft-delete/archival flag
 } WebOrderPickup;
 
 typedef struct {
-    int store_idx;
-    int customer_idx;
-    char bike_serial[NAME_LEN];
-    char date[NAME_LEN];
-    double fork_psi;
-    int fork_rebound;
-    double shock_psi;
-    int shock_rebound;
-    char notes[NAME_LEN * 2];
-    int hidden;
+    int store_idx;            // store where setup was recorded
+    int customer_idx;         // linked customer index (or -1)
+    char bike_serial[NAME_LEN]; // bike/fork serial reference
+    char date[NAME_LEN];      // setup date
+    double fork_psi;          // recorded fork pressure
+    int fork_rebound;         // recorded fork rebound clicks
+    double shock_psi;         // recorded rear shock pressure
+    int shock_rebound;        // recorded shock rebound clicks
+    char notes[NAME_LEN * 2]; // extra tuning notes
+    int hidden;               // soft-delete/archival flag
 } SuspensionSetupLog;
 
 typedef struct {
-    char transaction_id[NAME_LEN];
-    int store_idx;
-    char sku[NAME_LEN];
-    int qty;
-    char created_at[NAME_LEN];
-    int synced;
-    int hidden;
+    char transaction_id[NAME_LEN]; // local transaction reference
+    int store_idx;                 // originating store index
+    char sku[NAME_LEN];            // primary SKU impact
+    int qty;                       // quantity delta for sync event
+    char created_at[NAME_LEN];     // queue timestamp
+    int synced;                    // 1 when merge engine has applied event
+    int hidden;                    // soft-delete/archival flag
 } OfflineSyncQueueItem;
 
 typedef struct {
-    int stand_number;
-    int work_order_id;
-    char mechanic[NAME_LEN];
-    int active;
+    int stand_number;      // physical stand identifier
+    int work_order_id;     // assigned work order ID
+    char mechanic[NAME_LEN]; // assigned mechanic name
+    int active;            // 1 when stand is currently occupied
 } RepairStandAssignment;
 
 typedef enum { ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MECHANIC, ROLE_INVENTORY_MANAGER, ROLE_SERVICE_LEAD, ROLE_BUYER } UserRole;
@@ -357,54 +374,62 @@ typedef struct {
     int special_order_count;
 } Store;
 
+/*
+ * Application state (single-process, in-memory runtime).
+ *
+ * Notes:
+ * - Arrays are intentionally static for predictable memory use and easy persistence.
+ * - Many workflows refer to records by index (store_idx, customer_idx, etc.), so index
+ *   stability is preserved whenever possible.
+ */
 static Store stores[MAX_STORES];
-static int store_count = 0;
+static int store_count = 0; // number of active stores in memory
 static TaxExceptionReason tax_exceptions[MAX_TAX_EXCEPTIONS];
-static int tax_exception_count = 0;
+static int tax_exception_count = 0; // active tax exception reason count
 static TimeClockEntry time_clock_entries[MAX_TIME_CLOCK_ENTRIES];
-static int time_clock_count = 0;
+static int time_clock_count = 0; // active time-clock row count
 static CustomerNote customer_notes[MAX_CUSTOMER_NOTES];
-static int customer_note_count = 0;
+static int customer_note_count = 0; // active customer-note row count
 static WorkOrder work_orders[MAX_WORK_ORDERS];
-static int work_order_count = 0;
-static int next_work_order_id = 1000;
+static int work_order_count = 0; // active work order count
+static int next_work_order_id = 1000; // monotonic work order ID source
 static AuditLog audit_logs[MAX_AUDIT_LOGS];
-static int audit_log_count = 0;
+static int audit_log_count = 0; // active audit-log entry count
 static Reservation reservations[MAX_RESERVATIONS];
-static int reservation_count = 0;
-static int next_reservation_id = 5000;
+static int reservation_count = 0; // active reservation count
+static int next_reservation_id = 5000; // monotonic reservation ID source
 static PaymentEntry payment_entries[MAX_PAYMENT_ENTRIES];
-static int payment_entry_count = 0;
+static int payment_entry_count = 0; // active payment-ledger entry count
 static PurchaseOrder purchase_orders[MAX_PURCHASE_ORDERS];
-static int purchase_order_count = 0;
-static int next_purchase_order_id = 8000;
+static int purchase_order_count = 0; // active purchase-order count
+static int next_purchase_order_id = 8000; // monotonic purchase-order ID source
 static VendorProductLink vendor_links[MAX_VENDOR_LINKS];
-static int vendor_link_count = 0;
+static int vendor_link_count = 0; // active vendor-link mapping count
 static QbpCatalogItem qbp_catalog[MAX_QBP_CATALOG_ITEMS];
-static int qbp_catalog_count = 0;
+static int qbp_catalog_count = 0; // cached QBP catalog row count
 static WebOrderPickup web_order_pickups[MAX_WEB_ORDER_PICKUPS];
-static int web_order_pickup_count = 0;
+static int web_order_pickup_count = 0; // web-order pickup record count
 static SuspensionSetupLog suspension_logs[MAX_SUSPENSION_LOGS];
-static int suspension_log_count = 0;
+static int suspension_log_count = 0; // suspension setup history row count
 static OfflineSyncQueueItem sync_queue[MAX_SYNC_QUEUE];
-static int sync_queue_count = 0;
+static int sync_queue_count = 0; // offline sync queue depth
 static RepairStandAssignment repair_stands[MAX_REPAIR_STANDS];
-static int repair_stand_count = 8;
-static UserRole active_user_role = ROLE_MANAGER;
-static char manager_override_pin[NAME_LEN] = "2468";
-static AppSettings app_settings = {1, 1, 7, 10, 15.0, 0, 0.0825, 15.0};
-static char system_sales_popup_message[NAME_LEN * 3] = "Verify info for registration.";
-static char current_sales_user[NAME_LEN] = "Ascend User";
-static int enable_multistore_sync = 1;
-static int trek_auto_register = 1;
-static ThemeMode active_theme_mode = THEME_SMART;
-static int mobile_floor_mode_enabled = 0;
-static int internet_online = 1;
-static int local_node_enabled = 1;
-static int store_and_forward_enabled = 1;
-static GtkCssProvider *app_css_provider = NULL;
-static GtkWidget *main_window;
-static GtkWidget *status_label;
+static int repair_stand_count = 8; // configured stand count for this deployment
+static UserRole active_user_role = ROLE_MANAGER; // currently active permission role
+static char manager_override_pin[NAME_LEN] = "2468"; // override PIN for restricted actions
+static AppSettings app_settings = {1, 1, 7, 10, 15.0, 0, 0.0825, 15.0}; // app policy/config values
+static char system_sales_popup_message[NAME_LEN * 3] = "Verify info for registration."; // sales popup template
+static char current_sales_user[NAME_LEN] = "Ascend User"; // default logged-in operator name
+static int enable_multistore_sync = 1; // multi-store sync toggle
+static int trek_auto_register = 1; // Trek registration auto-prompt toggle
+static ThemeMode active_theme_mode = THEME_SMART; // active theme selection
+static int mobile_floor_mode_enabled = 0; // tablet/floor layout toggle
+static int internet_online = 1; // connectivity state used by blackout protocol
+static int local_node_enabled = 1; // local edge node mode toggle
+static int store_and_forward_enabled = 1; // offline card/token queue mode toggle
+static GtkCssProvider *app_css_provider = NULL; // shared CSS provider for runtime theming
+static GtkWidget *main_window; // top-level GTK application window
+static GtkWidget *status_label; // status bar label widget
 
 #define MAX_TILES 20
 #define TILE_SIZE_SMALL 100
@@ -416,22 +441,22 @@ typedef enum { SIZE_SMALL, SIZE_WIDE, SIZE_LARGE } TileSize;
 typedef enum { COLOR_LIGHT_BLUE, COLOR_DARK_BLUE, COLOR_GREEN, COLOR_ORANGE, COLOR_SLATE } TileColor;
 
 typedef struct {
-    TileType type;
-    char label[NAME_LEN];
-    int x, y;
-    int width, height;
-    TileSize size;
-    TileColor color;
-    int visible;
+    TileType type;           // action bound to tile click
+    char label[NAME_LEN];    // text shown on tile
+    int x, y;                // tile position on desktop canvas
+    int width, height;       // rendered tile size
+    TileSize size;           // logical tile size class
+    TileColor color;         // color theme selection for tile
+    int visible;             // 1 when tile should be shown
 } Tile;
 
 static Tile tiles[MAX_TILES];
-static int tile_count = 11;
-static int desktop_locked = 1;
-static int tiles_initialized = 0;
-static int dragging_tile = -1;
-static int drag_start_x, drag_start_y;
-static GtkWidget *desktop_canvas = NULL;
+static int tile_count = 11; // number of configured desktop tiles
+static int desktop_locked = 1; // 1 disables tile dragging/edits
+static int tiles_initialized = 0; // one-time tile default initialization guard
+static int dragging_tile = -1; // tile index currently being dragged (-1 none)
+static int drag_start_x, drag_start_y; // pointer origin for current drag operation
+static GtkWidget *desktop_canvas = NULL; // drawing area for desktop tile surface
 
 #define LAY_COL_SKU 0
 #define LAY_COL_DESC 1
@@ -445,41 +470,41 @@ static GtkWidget *desktop_canvas = NULL;
 #define LAY_COL_COUNT 9
 
 typedef struct {
-    Store *store;
-    int store_idx;
-    int customer_idx;
-    Transaction txn;
-    int saved;
-    double subtotal;
-    double tax;
-    double shipping;
-    double discount;
-    double total;
-    double payments_total;
-    GtkWidget *dialog;
-    GtkListStore *items_store;
-    GtkListStore *payments_store;
-    GtkWidget *total_label;
-    GtkWidget *subtotal_label;
-    GtkWidget *tax_label;
-    GtkWidget *shipping_entry;
-    GtkWidget *discount_entry;
-    GtkWidget *tax_rate_combo;
-    GtkWidget *tax_rate_entry;
-    GtkWidget *payments_label;
-    GtkWidget *balance_label;
-    GtkWidget *created_label;
-    GtkWidget *modified_label;
-    GtkWidget *created_by_label;
-    GtkWidget *transaction_id_label;
-    GtkWidget *register_status_combo;
-    GtkWidget *register_date_entry;
-    GtkWidget *barcode_entry;
-    GtkWidget *salesperson_combo;
-    GtkWidget *due_date_entry;
-    GtkWidget *status_right_label;
-    GtkListStore *notes_store;
-    GtkWidget *notes_tree;
+    Store *store;                 // active store pointer
+    int store_idx;                // active store index
+    int customer_idx;             // active customer index
+    Transaction txn;              // staged layaway transaction object
+    int saved;                    // 1 when save has completed for current draft
+    double subtotal;              // items subtotal
+    double tax;                   // computed tax amount
+    double shipping;              // shipping charge
+    double discount;              // discount amount
+    double total;                 // total due (subtotal + tax + shipping - discount)
+    double payments_total;        // sum of all entered payments
+    GtkWidget *dialog;            // owning workbench dialog
+    GtkListStore *items_store;    // line-item grid model
+    GtkListStore *payments_store; // payment-entry grid model
+    GtkWidget *total_label;       // total display label
+    GtkWidget *subtotal_label;    // subtotal display label
+    GtkWidget *tax_label;         // tax display label
+    GtkWidget *shipping_entry;    // shipping input control
+    GtkWidget *discount_entry;    // discount input control
+    GtkWidget *tax_rate_combo;    // tax-rate selector
+    GtkWidget *tax_rate_entry;    // optional free-form tax-rate field
+    GtkWidget *payments_label;    // payments total display
+    GtkWidget *balance_label;     // remaining balance display
+    GtkWidget *created_label;     // created timestamp label
+    GtkWidget *modified_label;    // last-modified timestamp label
+    GtkWidget *created_by_label;  // creator display label
+    GtkWidget *transaction_id_label; // transaction ID display label
+    GtkWidget *register_status_combo; // bike registration state selector
+    GtkWidget *register_date_entry;   // bike registration date input
+    GtkWidget *barcode_entry;         // barcode scan/input field
+    GtkWidget *salesperson_combo;     // salesperson selector
+    GtkWidget *due_date_entry;        // due date input for layaway
+    GtkWidget *status_right_label;    // right-panel status indicator label
+    GtkListStore *notes_store;        // customer-note list model
+    GtkWidget *notes_tree;            // customer-note tree view
 } LayawayWorkbenchContext;
 
 // Forward declarations
@@ -751,7 +776,7 @@ static void customize_desktop_tiles_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
-// Utility function to show info dialog
+/* Common informational popup helper used across all modules. */
 static void show_info_dialog(const char *message) {
     GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(main_window),
                                               GTK_DIALOG_MODAL,
@@ -762,7 +787,7 @@ static void show_info_dialog(const char *message) {
     gtk_widget_destroy(dialog);
 }
 
-// Utility function to show error dialog
+/* Common error popup helper used for validation failures and operation errors. */
 static void show_error_dialog(const char *message) {
     GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(main_window),
                                               GTK_DIALOG_MODAL,
@@ -788,6 +813,7 @@ static void add_audit_log_entry(const char *user, const char *action, const char
     log->hidden = 0;
 }
 
+/* Human-readable role labels for dialogs and audit context. */
 static const char *user_role_name(UserRole role) {
     switch (role) {
         case ROLE_ADMIN: return "System Admin";
@@ -801,30 +827,41 @@ static const char *user_role_name(UserRole role) {
     return "Unknown";
 }
 
+/* Manager/admin privilege checks for high-impact operations. */
 static int role_can_manage(void) {
     return active_user_role == ROLE_ADMIN || active_user_role == ROLE_MANAGER;
 }
 
+/* Service operations include techs and service leads in addition to managers. */
 static int role_can_service(void) {
     return role_can_manage() || active_user_role == ROLE_MECHANIC || active_user_role == ROLE_SERVICE_LEAD;
 }
 
+/* Inventory operations include dedicated inventory role plus managers/admin. */
 static int role_can_inventory(void) {
     return role_can_manage() || active_user_role == ROLE_INVENTORY_MANAGER;
 }
 
+/* SQL query surface is intentionally restricted to admin-only. */
 static int role_can_sql_query(void) {
     return active_user_role == ROLE_ADMIN;
 }
 
+/* Service lead authority for queue and stand prioritization controls. */
 static int role_can_service_lead(void) {
     return role_can_manage() || active_user_role == ROLE_SERVICE_LEAD;
 }
 
+/* Buyer authority for purchasing and margin comparison tools. */
 static int role_can_buying(void) {
     return role_can_manage() || active_user_role == ROLE_BUYER;
 }
 
+/*
+ * Manager override flow:
+ * - Non-manager users can unlock protected actions with a manager PIN.
+ * - Both successful and failed attempts are audit logged.
+ */
 static int request_manager_override(const char *action_name) {
     if (role_can_manage()) return 1;
 
@@ -860,6 +897,7 @@ static int request_manager_override(const char *action_name) {
     return allowed;
 }
 
+/* Security console for active-role switching and manager PIN rotation. */
 static void security_permissions_dialog(void) {
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Security and Permissions",
                                                    GTK_WINDOW(main_window),
@@ -1346,6 +1384,12 @@ static void add_split_payment_entry_dialog(void) {
 }
 
 static void payment_ledger_report_dialog(void) {
+    /*
+     * Payment ledger report:
+     * - Shows normalized payment events captured through split/full payment entries.
+     * - Uses ledger rows (not transaction payment_type) so tender history remains accurate
+     *   when multiple payment methods are used against a single transaction.
+     */
     int si = choose_store_index();
     if (si < 0) return;
     Store *s = &stores[si];
@@ -1406,6 +1450,12 @@ static const char *purchase_order_status_name(int status) {
 }
 
 static void create_purchase_order_dialog(void) {
+    /*
+     * Purchase order creation flow:
+     * - Validates SKU existence inside selected store catalog.
+     * - Creates immutable PO header/line snapshot and increments product on_order_qty.
+     * - Writes audit trail for procurement traceability.
+     */
     if (!role_can_manage() && !request_manager_override("Create Purchase Order")) return;
     int si = choose_store_index();
     if (si < 0) return;
@@ -1436,11 +1486,11 @@ static void create_purchase_order_dialog(void) {
 
     gtk_widget_show_all(dialog);
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
-        const char *sku = gtk_entry_get_text(GTK_ENTRY(sku_entry));
-        const char *vendor = gtk_entry_get_text(GTK_ENTRY(vendor_entry));
-        int qty = atoi(gtk_entry_get_text(GTK_ENTRY(qty_entry)));
-        const char *expected = gtk_entry_get_text(GTK_ENTRY(expected_entry));
-        const char *comments = gtk_entry_get_text(GTK_ENTRY(comments_entry));
+        const char *sku = gtk_entry_get_text(GTK_ENTRY(sku_entry)); // target SKU to order
+        const char *vendor = gtk_entry_get_text(GTK_ENTRY(vendor_entry)); // supplier override
+        int qty = atoi(gtk_entry_get_text(GTK_ENTRY(qty_entry))); // requested order quantity
+        const char *expected = gtk_entry_get_text(GTK_ENTRY(expected_entry)); // ETA date text
+        const char *comments = gtk_entry_get_text(GTK_ENTRY(comments_entry)); // buyer notes
 
         Product *p = NULL;
         for (int i = 0; i < s->product_count; i++) {
@@ -1484,6 +1534,12 @@ static void create_purchase_order_dialog(void) {
 }
 
 static void receive_purchase_order_dialog(void) {
+    /*
+     * PO receiving flow:
+     * - Accepts partial receipts and updates PO status: Open -> Partial -> Received.
+     * - Pushes received quantity into stock and received_qty, while decrementing on_order_qty.
+     * - Prevents over-receipt to avoid phantom inventory inflation.
+     */
     if (!role_can_manage() && !request_manager_override("Receive Purchase Order")) return;
     int si = choose_store_index();
     if (si < 0) return;
@@ -1526,15 +1582,15 @@ static void receive_purchase_order_dialog(void) {
 
     gtk_widget_show_all(dialog);
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
-        int active = gtk_combo_box_get_active(GTK_COMBO_BOX(po_combo));
-        int qty_recv = atoi(gtk_entry_get_text(GTK_ENTRY(qty_entry)));
+        int active = gtk_combo_box_get_active(GTK_COMBO_BOX(po_combo)); // selected PO index in ui list
+        int qty_recv = atoi(gtk_entry_get_text(GTK_ENTRY(qty_entry))); // received quantity for this operation
         if (active < 0 || active >= po_index_count) {
             show_error_dialog("Select a purchase order.");
         } else if (qty_recv <= 0) {
             show_error_dialog("Received quantity must be positive.");
         } else {
             PurchaseOrder *po = &purchase_orders[po_indices[active]];
-            int remaining = po->qty_ordered - po->qty_received;
+            int remaining = po->qty_ordered - po->qty_received; // quantity still outstanding
             if (qty_recv > remaining) {
                 show_error_dialog("Received quantity exceeds remaining quantity.");
             } else {
@@ -1695,6 +1751,12 @@ static int should_use_dark_mode(ThemeMode mode) {
     return (tm_info->tm_hour >= 19 || tm_info->tm_hour < 7) ? 1 : 0;
 }
 
+/*
+ * Applies visual styling and display sizing:
+ * - Chooses light/dark CSS map based on selected mode or smart heuristic.
+ * - Registers CSS provider at application priority.
+ * - Updates default window size when mobile-floor mode is enabled.
+ */
 static void apply_visual_theme(ThemeMode mode) {
     active_theme_mode = mode;
     if (!app_css_provider) app_css_provider = gtk_css_provider_new();
@@ -1744,6 +1806,7 @@ static void apply_visual_theme(ThemeMode mode) {
     }
 }
 
+/* Theme settings dialog for explicit light/dark/smart and mobile-floor toggle. */
 static void theme_display_dialog(void) {
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Theme and Display Mode",
                                                    GTK_WINDOW(main_window),
@@ -1963,6 +2026,7 @@ static void sql_query_tools_dialog(void) {
     show_info_dialog("SQL Query, Cust. Query, and Prod. Query tools are enabled for System Admin.\nHook this dialog to a secure query engine with parameterized execution.");
 }
 
+/* Queues a local transaction delta for eventual cloud merge during reconnect. */
 static void queue_offline_sync_item(const char *transaction_id, int store_idx, const char *sku, int qty) {
     if (sync_queue_count >= MAX_SYNC_QUEUE) return;
     OfflineSyncQueueItem *q = &sync_queue[sync_queue_count++];
@@ -1977,6 +2041,14 @@ static void queue_offline_sync_item(const char *transaction_id, int store_idx, c
     q->hidden = 0;
 }
 
+/*
+ * Central vendor middleware hub.
+ *
+ * This dialog consolidates integration entry points for:
+ * - QBP catalog synchronization and warehouse availability lookup
+ * - Warranty auto-fill for serialized bikes
+ * - Web-order pickup linkage from manufacturer order numbers to local labor
+ */
 static void vendor_integration_hub_dialog(void) {
     if (!role_can_inventory() && !role_can_buying() && !request_manager_override("Vendor Integration Hub")) return;
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Vendor Integration Hub",
@@ -2057,6 +2129,10 @@ static void vendor_integration_hub_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
+/*
+ * Warranty lookup flow (stub): validates serial + brand context and returns
+ * an inferred warranty start date and baseline build specification.
+ */
 static void warranty_autofill_dialog(void) {
     if (!role_can_service() && !request_manager_override("Warranty Auto-Fill")) return;
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Warranty Auto-Fill",
@@ -2090,6 +2166,10 @@ static void warranty_autofill_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
+/*
+ * Captures direct-to-consumer manufacturer orders that require in-store assembly,
+ * mapping manufacturer order references to local labor SKU workflow.
+ */
 static void web_order_pickup_dialog(void) {
     if (!role_can_service() && !role_can_inventory() && !request_manager_override("Web Order Pickup")) return;
     int si = choose_store_index();
@@ -2137,6 +2217,12 @@ static void web_order_pickup_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
+/*
+ * Offline operations control panel:
+ * - toggles online/offline state
+ * - queues example offline transactions
+ * - runs merge simulation with conflict counting and audit trail
+ */
 static void offline_blackout_protocol_dialog(void) {
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Blackout Protocol (Hybrid Cloud)",
                                                    GTK_WINDOW(main_window),
@@ -2200,6 +2286,7 @@ static void offline_blackout_protocol_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
+/* Assigns work orders to specific service stands and mechanics. */
 static void service_stand_manager_dialog(void) {
     if (!role_can_service_lead() && !request_manager_override("Stand Manager")) return;
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Stand Manager",
@@ -2236,6 +2323,7 @@ static void service_stand_manager_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
+/* Applies predefined labor+parts bundles to a selected work order. */
 static void labor_bundle_dialog(void) {
     if (!role_can_service() && !request_manager_override("Labor + Parts Bundle")) return;
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Labor + Parts Bundle",
@@ -2282,6 +2370,7 @@ static void labor_bundle_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
+/* Trade-in estimate workflow (stub heuristic standing in for Bluebook API). */
 static void trade_in_bluebook_dialog(void) {
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Trade-In Bluebook",
                                                    GTK_WINDOW(main_window),
@@ -2323,6 +2412,7 @@ static void trade_in_bluebook_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
+/* Stores suspension tuning setup for bike-specific CRM history. */
 static void suspension_setup_log_dialog(void) {
     int si = choose_store_index();
     if (si < 0) return;
@@ -2367,6 +2457,7 @@ static void suspension_setup_log_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
+/* Queues customer-facing service progress text messages by work order stage. */
 static void work_order_progress_sms_dialog(void) {
     if (!role_can_service() && !request_manager_override("Work Order Progress SMS")) return;
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Work Order Progress SMS",
@@ -2399,6 +2490,7 @@ static void work_order_progress_sms_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
+/* Buyer-focused margin comparison view for source-selection decisions. */
 static void buyer_dashboard_dialog(void) {
     if (!role_can_buying() && !request_manager_override("Buying Dashboard")) return;
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Buying Dashboard",
@@ -2427,6 +2519,13 @@ static void buyer_dashboard_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
+/*
+ * Product lookup workflow:
+ * - Accepts exact identifiers (SKU, UPC, style/model/MPN) and partial text fallback.
+ * - Searches local store catalogs first, then QBP synchronized catalog cache.
+ * - Displays comprehensive specs plus linked warehouse availability when present.
+ * - Attempts local image file preview; otherwise shows URL reference text.
+ */
 static void product_lookup_dialog(void) {
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Product Lookup (SKU / UPC / Model)",
                                                    GTK_WINDOW(main_window),
@@ -2464,6 +2563,7 @@ static void product_lookup_dialog(void) {
             continue;
         }
 
+        /* First pass: exact identifier match for precision lookups (scanner-friendly). */
         Product *found = NULL;
         int found_store = -1;
         for (int si = 0; si < store_count && !found; si++) {
@@ -2478,6 +2578,7 @@ static void product_lookup_dialog(void) {
             }
         }
 
+        /* Second pass: partial text search for manual/fuzzy operator input. */
         if (!found) {
             for (int si = 0; si < store_count && !found; si++) {
                 Store *s = &stores[si];
@@ -2492,6 +2593,7 @@ static void product_lookup_dialog(void) {
             }
         }
 
+        /* Optional enrichment pass: attach QBP metadata/image/warehouse quantities. */
         const QbpCatalogItem *qbp = NULL;
         if (found) {
             for (int i = 0; i < qbp_catalog_count; i++) {
@@ -2776,6 +2878,12 @@ static void email_receipt_quote_stub_dialog(void) {
 }
 
 static void end_of_day_summary_report_dialog(void) {
+    /*
+     * End-of-day snapshot:
+     * - Counts today's transactions and returns.
+     * - Computes gross from transaction totals for the day.
+     * - Pairs with ledger tender breakdown for close-out balancing.
+     */
     int si = choose_store_index();
     if (si < 0) return;
     Store *s = &stores[si];
@@ -2862,6 +2970,11 @@ static void sales_without_customer_report_dialog(void) {
 }
 
 static void product_master_inventory_report_dialog(void) {
+    /*
+     * Product master report:
+     * - Recomputes committed quantities first so availability reflects open liabilities.
+     * - Prints pricing, cost basis, and margin proxy side-by-side with inventory posture.
+     */
     int si = choose_store_index();
     if (si < 0) return;
     Store *s = &stores[si];
@@ -2898,6 +3011,10 @@ static int selected_work_order_row_index(GtkWidget *dialog, GtkTreeIter *out_ite
 }
 
 static void on_work_order_update_status_clicked(GtkButton *button, gpointer data) {
+    /*
+     * Updates a selected work order lifecycle state from the service board.
+     * UI row and persisted model are both updated to keep view and storage in sync.
+     */
     (void)button;
     GtkWidget *dialog = GTK_WIDGET(data);
     if (!role_can_service() && !request_manager_override("Update Work Order Status")) return;
@@ -2945,6 +3062,10 @@ static void on_work_order_update_status_clicked(GtkButton *button, gpointer data
 }
 
 static void on_work_order_add_part_clicked(GtkButton *button, gpointer data) {
+    /*
+     * Adds a part charge directly into a work order and consumes inventory in-store.
+     * This keeps parts_total and stock synchronized at service-write time.
+     */
     (void)button;
     GtkWidget *dialog = GTK_WIDGET(data);
     if (!role_can_service() && !request_manager_override("Add Work Order Part")) return;
@@ -3099,6 +3220,12 @@ static void create_backup_snapshot(void) {
 }
 
 static void create_work_order_dialog(void) {
+    /*
+     * Work order intake:
+     * - Captures customer, serial, complaint, labor assumptions, and parts estimate.
+     * - Calculates financial baseline (labor_total + parts_total) at creation time.
+     * - Assigns unique work order ID and audit record for downstream service tracking.
+     */
     int si = choose_store_index();
     if (si < 0) return;
     Store *s = &stores[si];
@@ -3496,7 +3623,12 @@ static gboolean on_main_window_key_press(GtkWidget *widget, GdkEventKey *event, 
     return FALSE; // Event not handled
 }
 
-// Create the main menu
+/*
+ * Main desktop composition:
+ * - Builds all top-level menus and module entry points.
+ * - Rebuilds central desktop canvas and status bar.
+ * - Serves as the navigation shell for nearly every workflow.
+ */
 static void show_main_menu(void) {
     if (!tiles_initialized) {
         init_default_tiles();
@@ -4802,6 +4934,11 @@ static void refresh_daily_sales_payment_report(GtkWidget *dialog) {
 }
 
 static void daily_sales_payment_report_dialog(void) {
+    /*
+     * Date-range sales/tender report shell.
+     * The Refresh handler re-runs calculations using current date filters and updates
+     * a text view so operators can quickly iterate date windows before export.
+     */
     int si = choose_store_index();
     if (si < 0) return;
 
@@ -5302,6 +5439,12 @@ static void trek_registration_prompt(Store *s, Quote *q, int item_index) {
 }
 
 static void create_quote_dialog(void) {
+    /*
+     * Quote builder:
+     * - Incrementally collects SKU + quantity lines.
+     * - Validates stock availability at quote-time to reduce later conversion failures.
+     * - Stores registration placeholders used by Trek serialized sale conversion.
+     */
     int si = choose_store_index();
     if (si < 0) return;
     Store *s = &stores[si];
@@ -5360,6 +5503,7 @@ static void create_quote_dialog(void) {
             continue;
         }
 
+        /* Resolve SKU against local store catalog before adding line item. */
         int found = -1;
         for (int i = 0; i < s->product_count; i++) {
             if (strcmp(s->products[i].sku, sku) == 0) { found = i; break; }
@@ -5396,6 +5540,12 @@ static void create_quote_dialog(void) {
 }
 
 static void process_quote_to_sale_dialog(void) {
+    /*
+     * Converts an active quote into a realized sale:
+     * - Prompts Trek registration flow for serialized Trek items.
+     * - Reduces stock and increments sold counters.
+     * - Closes quote and updates store-level sales metrics.
+     */
     int si = choose_store_index();
     if (si < 0) return;
     Store *s = &stores[si];
@@ -5664,7 +5814,14 @@ static void show_trend_dialog(void) {
     gtk_widget_destroy(dialog);
 }
 
-// Save and load functions (same as original)
+/*
+ * Persists the complete application state into ascend_data.txt.
+ *
+ * Format notes:
+ * - The file starts with base store records.
+ * - Extended features are serialized in tagged sections (e.g., QBP_CATALOG, SYNC_QUEUE).
+ * - String-heavy sections are newline-delimited for human readability and simple parsing.
+ */
 static void save_data(void) {
     FILE *f = fopen("ascend_data.txt", "w");
     if (!f) {
@@ -5805,6 +5962,7 @@ static void save_data(void) {
         fprintf(f, "%s\n%s\n%s\n%s\n%s\n%s\n", po->sku, po->vendor, po->expected_date, po->received_date, po->created_at, po->comments);
     }
 
+    /* Extended product attributes are emitted in a versioned section. */
     fprintf(f, "PRODUCT_MASTER_EXT\n");
     for (int si = 0; si < store_count; si++) {
         Store *s = &stores[si];
@@ -5829,6 +5987,7 @@ static void save_data(void) {
     }
     fprintf(f, "END_PRODUCT_MASTER_EXT\n");
 
+    /* Extended customer profile fields are similarly versioned. */
     fprintf(f, "CUSTOMER_PROFILE_EXT\n");
     for (int si = 0; si < store_count; si++) {
         Store *s = &stores[si];
@@ -5891,6 +6050,10 @@ static void save_data(void) {
 }
 
 static void load_data(void) {
+    /*
+     * Loads base records first, then scans tagged sections in any supported order.
+     * Defaults are initialized before parsing so omitted/newer sections are safe.
+     */
     FILE *f = fopen("ascend_data.txt", "r");
     if (!f) {
         show_error_dialog("Unable to load data!");
@@ -6135,6 +6298,10 @@ static void load_data(void) {
         tiles_initialized = 1;
     }
 
+    /*
+     * Section-based parser for optional modules.
+     * Unknown/new blocks are skipped safely because defaults were initialized above.
+     */
     char section_name[NAME_LEN];
     while (fscanf(f, "%63s", section_name) == 1) {
         if (strcmp(section_name, "TAX_EXCEPTIONS") == 0) {
@@ -7633,6 +7800,12 @@ static void on_layaway_note_remove(GtkWidget *widget, gpointer data) {
 }
 
 static void layaway_policy_settings_dialog(GtkWidget *widget, gpointer data) {
+    /*
+     * Policy editor for layaway automation:
+     * - reminder_days controls pre-due nudges
+     * - grace_days controls post-due tolerance window
+     * - cancel_fee_percent is attached as metadata when auto-cancel occurs
+     */
     (void)widget;
     LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Layaway Policy Settings",
@@ -7677,6 +7850,12 @@ static void layaway_policy_settings_dialog(GtkWidget *widget, gpointer data) {
 }
 
 static void on_apply_layaway_rules_clicked(GtkButton *button, gpointer data) {
+    /*
+     * Policy enforcement pass for layaways:
+     * - Evaluates open layaways against due date and grace policy.
+     * - Auto-cancels overdue records when enabled.
+     * - Tags transaction notes with cancellation fee metadata for audit/reconciliation.
+     */
     (void)button;
     if (!request_manager_override("Apply Layaway Cancellation Rules")) return;
     Store *s = (Store *)data;
@@ -7735,6 +7914,7 @@ static void layaway_touch_modified(LayawayWorkbenchContext *ctx) {
 }
 
 static double layaway_get_tax_rate(LayawayWorkbenchContext *ctx) {
+    /* Tax selector with common presets and a configurable default-tax slot. */
     int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(ctx->tax_rate_combo));
     if (idx == 0) return 0.00;
     if (idx == 1) return 0.04;
@@ -7743,10 +7923,15 @@ static double layaway_get_tax_rate(LayawayWorkbenchContext *ctx) {
 }
 
 static void layaway_recalc_totals(LayawayWorkbenchContext *ctx) {
+    /*
+     * Single source of truth for layaway math.
+     * Rebuilds subtotal/tax/total/balance every time grid or payment inputs change.
+     */
     GtkTreeIter iter;
     gboolean valid;
     double subtotal = 0.0;
 
+    /* Compute line totals and accumulate subtotal from all current rows. */
     valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(ctx->items_store), &iter);
     while (valid) {
         double price = 0.0;
@@ -7768,6 +7953,7 @@ static void layaway_recalc_totals(LayawayWorkbenchContext *ctx) {
     ctx->discount = atof(gtk_entry_get_text(GTK_ENTRY(ctx->discount_entry)));
     if (ctx->discount < 0.0) ctx->discount = 0.0;
 
+    /* Tax is applied after discount and before shipping in this implementation. */
     ctx->tax = (ctx->subtotal - ctx->discount) * layaway_get_tax_rate(ctx);
     if (ctx->tax < 0.0) ctx->tax = 0.0;
     ctx->total = ctx->subtotal + ctx->tax + ctx->shipping - ctx->discount;
@@ -8076,6 +8262,10 @@ static void on_layaway_serial_lookup(GtkWidget *widget, gpointer data) {
 }
 
 static void on_layaway_save(GtkWidget *widget, gpointer data) {
+    /*
+     * Persists workbench state as an open/updated layaway transaction and mirrors
+     * payment lines into payment ledger rows to keep tender reporting consistent.
+     */
     (void)widget;
     LayawayWorkbenchContext *ctx = (LayawayWorkbenchContext *)data;
     if (ctx->saved) {
@@ -8200,6 +8390,12 @@ static GtkWidget *layaway_new_menu_item(GtkWidget *menu, const char *label, GCal
 }
 
 static void layaway_workbench_dialog(Store *s, int store_idx, int customer_idx) {
+    /*
+     * Enterprise layaway workbench UI:
+     * - Multi-pane workspace for items, payments, customer notes, and policy tools.
+     * - Toolbar/menu architecture mimics full POS workstation navigation style.
+     * - Context title and transaction metadata keep operator aware of store/customer scope.
+     */
     LayawayWorkbenchContext *ctx = g_malloc0(sizeof(LayawayWorkbenchContext));
     ctx->store = s;
     ctx->store_idx = store_idx;
@@ -8333,6 +8529,7 @@ static void layaway_workbench_dialog(Store *s, int store_idx, int customer_idx) 
     gtk_label_set_markup(GTK_LABEL(title_context), context_markup);
     gtk_box_pack_start(GTK_BOX(root), title_context, FALSE, FALSE, 0);
 
+    /* Split layout: left=items/payment actions, right=customer/totals/notes utilities. */
     GtkWidget *hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_box_pack_start(GTK_BOX(root), hpaned, TRUE, TRUE, 0);
 
@@ -9085,6 +9282,12 @@ static void create_return_dialog(void) {
     }
 
 static void complete_sale_dialog(void) {
+    /*
+     * Complete-a-sale utility:
+     * - Finds open transactions by ID or customer text.
+     * - Provides operator confirmation with line-item review.
+     * - Finalizes sale, updates customer last-visit, and decrements inventory.
+     */
 
     int si = choose_store_index();
     if (si < 0) return;
@@ -9110,16 +9313,16 @@ static void complete_sale_dialog(void) {
         int response = gtk_dialog_run(GTK_DIALOG(dialog));
 
         if (response == 1) { // Find Transaction
-            const char *search_term = gtk_entry_get_text(GTK_ENTRY(search_entry));
+            const char *search_term = gtk_entry_get_text(GTK_ENTRY(search_entry)); // cashier-entered lookup token
 
             if (strlen(search_term) == 0) {
                 show_error_dialog("Please enter a transaction ID or customer name.");
                 continue;
             }
 
-            // Search for matching transactions
-            Transaction *found_txn = NULL;
-            int found_idx = -1;
+            // Search open transactions using ID substring or customer name substring.
+            Transaction *found_txn = NULL; // pointer to matched open transaction
+            int found_idx = -1; // index of matched transaction in store sales array
 
             for (int i = 0; i < s->sales_count; i++) {
                 Transaction *txn = &s->sales[i];
@@ -9146,9 +9349,9 @@ static void complete_sale_dialog(void) {
             }
 
             if (found_txn) {
-                // Show transaction details and allow completion
-                char txn_info[1000] = "TRANSACTION FOUND:\n\n";
-                char line[200];
+                // Build a human-readable summary so the cashier can verify before committing.
+                char txn_info[1000] = "TRANSACTION FOUND:\n\n"; // assembled summary shown to cashier
+                char line[200]; // scratch line buffer appended into txn_info
 
                 sprintf(line, "Transaction ID: %s\n", found_txn->transaction_id);
                 strcat(txn_info, line);
@@ -9194,7 +9397,7 @@ static void complete_sale_dialog(void) {
                 gtk_widget_show_all(detail_dialog);
 
                 if (gtk_dialog_run(GTK_DIALOG(detail_dialog)) == 1) {
-                    // Complete the transaction
+                    // Mark transaction as completed and realize revenue now.
                     found_txn->status = 1; // completed
                     s->sales_to_date += found_txn->total;
 
@@ -9202,7 +9405,7 @@ static void complete_sale_dialog(void) {
                         get_today_date(s->customers[found_txn->customer_idx].last_visit, sizeof(s->customers[found_txn->customer_idx].last_visit));
                     }
 
-                    // Update product stock (reduce inventory since items are now sold)
+                    // Consume inventory only when finalizing sale to preserve open-order commitments.
                     for (int i = 0; i < found_txn->item_count; i++) {
                         Product *p = NULL;
                         for (int j = 0; j < s->product_count; j++) {
@@ -9313,6 +9516,11 @@ static void special_order_prompt_dialog(Store *s, const char *sku, int qty, int 
 }
 
 static void reorder_list_dialog(void) {
+    /*
+     * Reorder workbench:
+     * - Builds a list of special-order demand needing procurement actions.
+     * - Supports selective ordering from a single operational queue.
+     */
     int si = choose_store_index();
     if (si < 0) return;
     Store *s = &stores[si];
@@ -10038,6 +10246,14 @@ static void send_special_order_notifications(GtkWidget *widget, gpointer data) {
 }
 
 int main(int argc, char *argv[]) {
+    /*
+     * Startup order is important:
+     * 1) Initialize GTK runtime
+     * 2) Load persisted data and settings
+     * 3) Build shell UI and attach handlers
+     * 4) Apply theme after UI creation so styling hits all widgets
+     * 5) Enter GTK main loop
+     */
     gtk_init(&argc, &argv);
 
     load_data();
