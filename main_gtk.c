@@ -853,6 +853,46 @@ static int extract_between(const char *source, const char *start_token, const ch
     return out[0] != '\0';
 }
 
+static int extract_first_between(const char *source,
+                                 const char *start_tokens[],
+                                 size_t start_token_count,
+                                 const char *end_token,
+                                 char *out,
+                                 size_t out_size) {
+    if (!source || !start_tokens || start_token_count == 0 || !end_token || !out || out_size == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < start_token_count; i++) {
+        if (start_tokens[i] && extract_between(source, start_tokens[i], end_token, out, out_size)) {
+            return 1;
+        }
+    }
+    out[0] = '\0';
+    return 0;
+}
+
+static int contains_case_insensitive(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !*haystack || !*needle) return 0;
+    gchar *haystack_lower = g_ascii_strdown(haystack, -1);
+    gchar *needle_lower = g_ascii_strdown(needle, -1);
+    int found = (strstr(haystack_lower, needle_lower) != NULL);
+    g_free(haystack_lower);
+    g_free(needle_lower);
+    return found;
+}
+
+static int scanned_product_matches_identifier(const ScannedProduct *p, const char *needle) {
+    if (!p || !needle || !*needle) return 0;
+    if ((p->sku[0] && strcmp(p->sku, needle) == 0) ||
+        (p->upc[0] && strcmp(p->upc, needle) == 0) ||
+        (p->manufacturer_part_number[0] && strcmp(p->manufacturer_part_number, needle) == 0)) {
+        return 1;
+    }
+    return contains_case_insensitive(p->name, needle) ||
+           contains_case_insensitive(p->category, needle) ||
+           contains_case_insensitive(p->manufacturer_part_number, needle);
+}
+
 static void normalize_url_to_absolute(const char *url, char *out, size_t out_size) {
     if (!url || !*url) {
         out[0] = '\0';
@@ -944,23 +984,101 @@ static int scrape_bikeworld_product_page(const char *url, ScannedProduct *out_pr
     memset(out_product, 0, sizeof(*out_product));
     strncpy(out_product->url, url, sizeof(out_product->url) - 1);
 
-    extract_between(html, "<meta property=\"og:title\" content=\"", "\"", out_product->name, sizeof(out_product->name));
-    extract_between(html, "\"Brand\":{\"@type\":\"Brand\",\"name\":\"", "\"", out_product->vendor, sizeof(out_product->vendor));
-    extract_between(html, "\"categoryName\":\"", "\"", out_product->category, sizeof(out_product->category));
+    {
+        const char *name_tokens[] = {
+            "<meta property=\"og:title\" content=\"",
+            "\"twitter:title\" content=\"",
+            "\"name\":\"",
+            "\"name\": \""
+        };
+        extract_first_between(html, name_tokens, sizeof(name_tokens) / sizeof(name_tokens[0]), "\"", out_product->name, sizeof(out_product->name));
+    }
+
+    {
+        const char *vendor_tokens[] = {
+            "\"Brand\":{\"@type\":\"Brand\",\"name\":\"",
+            "\"brandName\": \"",
+            "\"brandName\":\"",
+            "<span class=\"seProductBrandName\">"
+        };
+        extract_first_between(html, vendor_tokens, sizeof(vendor_tokens) / sizeof(vendor_tokens[0]), "\"", out_product->vendor, sizeof(out_product->vendor));
+        if (!out_product->vendor[0]) {
+            extract_between(html, "<span class=\"seProductBrandName\">", "</span>", out_product->vendor, sizeof(out_product->vendor));
+        }
+    }
+
+    {
+        const char *category_tokens[] = {
+            "\"categoryName\":\"",
+            "\"categoryName\": \"",
+            "<meta name=\"description\" content=\"Brand:"
+        };
+        extract_first_between(html, category_tokens, sizeof(category_tokens) / sizeof(category_tokens[0]), "\"", out_product->category, sizeof(out_product->category));
+    }
 
     char price_buf[64] = "";
-    if (!extract_between(html, "\"price\":\"", "\"", price_buf, sizeof(price_buf))) {
-        extract_between(html, "\"display\":\"$", "\"", price_buf, sizeof(price_buf));
+    {
+        const char *price_tokens[] = {
+            "\"price\":\"",
+            "\"price\": \"",
+            "\"display\":\"$",
+            "<div id=\"RegularPrice\" class=\"seRegularPrice\">$",
+            "<div id=\"ModalRegularPrice\" class=\"seRegularPrice\">$"
+        };
+        extract_first_between(html, price_tokens, sizeof(price_tokens) / sizeof(price_tokens[0]), "\"", price_buf, sizeof(price_buf));
+        if (!price_buf[0]) {
+            extract_between(html, "<div id=\"RegularPrice\" class=\"seRegularPrice\">$", "</div>", price_buf, sizeof(price_buf));
+        }
     }
     out_product->price = atof(price_buf);
 
     char store_sku[NAME_LEN] = "";
     char mpn[NAME_LEN] = "";
     char gtin[NAME_LEN] = "";
-    extract_between(html, "data-th=\"Store SKU\">", "</td>", store_sku, sizeof(store_sku));
-    extract_between(html, "data-th=\"MPN\">", "</td>", mpn, sizeof(mpn));
-    if (!extract_between(html, "\"gtin\":\"", "\"", gtin, sizeof(gtin))) {
-        extract_between(html, "\"gtins\":\"", "\"", gtin, sizeof(gtin));
+    {
+        const char *sku_tokens[] = {
+            "data-th=\"Store SKU\">",
+            "Store SKU</th>",
+            "\"sku\":\"",
+            "\"libId\": \"",
+            "\"libId\":\""
+        };
+        extract_first_between(html, sku_tokens, sizeof(sku_tokens) / sizeof(sku_tokens[0]), "</td>", store_sku, sizeof(store_sku));
+        if (strstr(store_sku, "</th>")) {
+            store_sku[0] = '\0';
+            extract_between(html, "data-th=\"Store SKU\">", "</td>", store_sku, sizeof(store_sku));
+        }
+        if (!store_sku[0]) {
+            extract_between(html, "\"sku\":\"", "\"", store_sku, sizeof(store_sku));
+        }
+    }
+    {
+        const char *mpn_tokens[] = {
+            "data-th=\"MPN\">",
+            "\"mpn\":\"",
+            "\"manufacturerPartNumber\":\""
+        };
+        extract_first_between(html, mpn_tokens, sizeof(mpn_tokens) / sizeof(mpn_tokens[0]), "</td>", mpn, sizeof(mpn));
+        if (strstr(mpn, "</th>")) {
+            mpn[0] = '\0';
+            extract_between(html, "data-th=\"MPN\">", "</td>", mpn, sizeof(mpn));
+        }
+        if (!mpn[0]) {
+            extract_between(html, "\"mpn\":\"", "\"", mpn, sizeof(mpn));
+        }
+    }
+    {
+        const char *upc_tokens[] = {
+            "\"gtin\":\"",
+            "\"gtins\":\"",
+            "data-th=\"UPC\">",
+            "\"upc\":\""
+        };
+        extract_first_between(html, upc_tokens, sizeof(upc_tokens) / sizeof(upc_tokens[0]), "\"", gtin, sizeof(gtin));
+        if (!gtin[0] || strstr(gtin, "</td>")) {
+            gtin[0] = '\0';
+            extract_between(html, "data-th=\"UPC\">", "</td>", gtin, sizeof(gtin));
+        }
     }
 
     if (store_sku[0]) strncpy(out_product->sku, store_sku, sizeof(out_product->sku) - 1);
@@ -970,7 +1088,8 @@ static int scrape_bikeworld_product_page(const char *url, ScannedProduct *out_pr
     strncpy(out_product->upc, gtin, sizeof(out_product->upc) - 1);
 
     out_product->in_stock = strstr(html, "https://schema.org/InStock") != NULL ||
-                            strstr(html, "\"label\":\"In Stock") != NULL;
+                            strstr(html, "\"label\":\"In Stock") != NULL ||
+                            strstr(html, "In Stock, Buy It Now") != NULL;
 
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
@@ -994,6 +1113,86 @@ static int scrape_bikeworld_product_page(const char *url, ScannedProduct *out_pr
     if (!out_product->category[0]) strncpy(out_product->category, "Uncategorized", sizeof(out_product->category) - 1);
     if (!out_product->sku[0]) strncpy(out_product->sku, "WEB-IMPORT", sizeof(out_product->sku) - 1);
     return 1;
+}
+
+static int scrape_bikeworld_by_identifier(const char *needle, ScannedProduct *out_product,
+                                          char *error_out, size_t error_size) {
+    if (!needle || !*needle) {
+        snprintf(error_out, error_size, "Enter UPC, SKU, or model number.");
+        return 0;
+    }
+
+    for (int i = 0; i < scanned_product_count; i++) {
+        if (scanned_product_matches_identifier(&scanned_products[i], needle)) {
+            *out_product = scanned_products[i];
+            return 1;
+        }
+    }
+
+    gchar *escaped = g_uri_escape_string(needle, NULL, FALSE);
+    if (!escaped) {
+        snprintf(error_out, error_size, "Unable to encode lookup value.");
+        return 0;
+    }
+
+    char search_url[NAME_LEN * 3];
+    snprintf(search_url, sizeof(search_url), "https://www.bikeworldiowa.com/sitesearch.cfm?search=%s", escaped);
+    g_free(escaped);
+
+    char *html = NULL;
+    if (!bikeworld_fetch_html(search_url, &html, error_out, error_size)) return 0;
+
+    const char *cursor = html;
+    char seen_urls[96][NAME_LEN * 2];
+    int seen_count = 0;
+    int attempts = 0;
+
+    while ((cursor = strstr(cursor, "href=\"")) != NULL && attempts < 40) {
+        cursor += strlen("href=\"");
+        const char *end = strstr(cursor, "\"");
+        if (!end) break;
+
+        char link[NAME_LEN * 2];
+        size_t len = (size_t)(end - cursor);
+        if (len >= sizeof(link)) len = sizeof(link) - 1;
+        memcpy(link, cursor, len);
+        link[len] = '\0';
+
+        if (strstr(link, "/product/") && strstr(link, ".htm")) {
+            char full_url[NAME_LEN * 2];
+            normalize_url_to_absolute(link, full_url, sizeof(full_url));
+
+            int already_seen = 0;
+            for (int i = 0; i < seen_count; i++) {
+                if (strcmp(seen_urls[i], full_url) == 0) {
+                    already_seen = 1;
+                    break;
+                }
+            }
+
+            if (!already_seen && seen_count < 96) {
+                strncpy(seen_urls[seen_count], full_url, sizeof(seen_urls[seen_count]) - 1);
+                seen_urls[seen_count][sizeof(seen_urls[seen_count]) - 1] = '\0';
+                seen_count++;
+                attempts++;
+
+                ScannedProduct candidate;
+                char product_error[256];
+                if (scrape_bikeworld_product_page(full_url, &candidate, product_error, sizeof(product_error)) &&
+                    scanned_product_matches_identifier(&candidate, needle)) {
+                    upsert_scraped_product(&candidate);
+                    *out_product = candidate;
+                    g_free(html);
+                    return 1;
+                }
+            }
+        }
+        cursor = end + 1;
+    }
+
+    g_free(html);
+    snprintf(error_out, error_size, "No Bike World product matched UPC/SKU/model value: %s", needle);
+    return 0;
 }
 
 static int scrape_bikeworld_catalog_page(const char *url, int *imported_count,
@@ -3174,6 +3373,8 @@ static void product_lookup_dialog(void) {
         int found_store = -1;
         const QbpCatalogItem *qbp = NULL;
         const ScannedProduct *scanned = NULL;
+        char lookup_error[256] = "";
+        int used_live_bikeworld_lookup = 0;
 
         /* Search based on selected site */
         if (site_choice == 1 || site_choice == 2) {
@@ -3205,19 +3406,33 @@ static void product_lookup_dialog(void) {
                 }
             }
         } else if (site_choice == 4) {
-            /* Bike World: search scanned products */
-            for (int i = 0; i < scanned_product_count; i++) {
-                if (strcmp(scanned_products[i].sku, needle) == 0 || strcmp(scanned_products[i].upc, needle) == 0 ||
-                    strcmp(scanned_products[i].manufacturer_part_number, needle) == 0 ||
-                    strstr(scanned_products[i].name, needle) || strstr(scanned_products[i].category, needle)) {
-                    scanned = &scanned_products[i];
-                    break;
+            /* Bike World: search cache first, then crawl site search results and product pages. */
+            gtk_label_set_text(GTK_LABEL(result_label), "Searching Bike World (cache + live site)...");
+            gtk_label_set_text(GTK_LABEL(image_hint), "Working...");
+            gtk_image_clear(GTK_IMAGE(image));
+            while (gtk_events_pending()) {
+                gtk_main_iteration();
+            }
+
+            ScannedProduct resolved;
+            used_live_bikeworld_lookup = 1;
+            if (scrape_bikeworld_by_identifier(needle, &resolved, lookup_error, sizeof(lookup_error))) {
+                int idx = upsert_scraped_product(&resolved);
+                if (idx >= 0 && idx < scanned_product_count) {
+                    scanned = &scanned_products[idx];
+                } else {
+                    scanned = &resolved;
                 }
+                save_data();
             }
         }
 
         if (!found && !qbp && !scanned) {
-            gtk_label_set_text(GTK_LABEL(result_label), "No product found for that value in selected source.");
+            if (site_choice == 4 && used_live_bikeworld_lookup && lookup_error[0]) {
+                gtk_label_set_text(GTK_LABEL(result_label), lookup_error);
+            } else {
+                gtk_label_set_text(GTK_LABEL(result_label), "No product found for that value in selected source.");
+            }
             gtk_image_clear(GTK_IMAGE(image));
             gtk_label_set_text(GTK_LABEL(image_hint), "Image: none");
             continue;
@@ -3284,7 +3499,7 @@ static void product_lookup_dialog(void) {
                      scanned->last_scanned,
                      scanned->url);
             gtk_image_clear(GTK_IMAGE(image));
-            gtk_label_set_text(GTK_LABEL(image_hint), "Image: none");
+            gtk_label_set_text(GTK_LABEL(image_hint), "Image: none (Bike World lookup complete)");
         }
 
         gtk_label_set_text(GTK_LABEL(result_label), details);
@@ -7460,7 +7675,7 @@ static void load_data(void) {
             pr->color[strcspn(pr->color, "\n")] = '\0';
             if (!fgets(pr->size, NAME_LEN, f)) break;
             pr->size[strcspn(pr->size, "\n")] = '\0';
-            fscanf(f, "%d %.2f %.2f %.2f %.2f %d %d %d %d %d %d %d %d %d %d %d\n",
+                 fscanf(f, "%d %lf %lf %lf %lf %d %d %d %d %d %d %d %d %d %d %d\n",
                    &pr->model_year,
                    &pr->msrp,
                    &pr->price,
